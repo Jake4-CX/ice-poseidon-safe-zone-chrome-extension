@@ -1,0 +1,31 @@
+{
+  "name": "safezone-plus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Live player search, favourites, stream links and alerts for Ice Poseidon's Safe Zone map.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "cli": "tsx src/cli/index.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build:ext": "node scripts/build-extension.mjs",
+    "watch:ext": "node scripts/build-extension.mjs --watch",
+    "package:ext": "node scripts/package-extension.mjs",
+    "capture": "tsx src/cli/index.ts capture",
+    "site:pull": "node --max-old-space-size=8192 scripts/site/pull.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.0",
+    "jsdom": "^25.0.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "webcrack": "^2.16.0"
+  },
+  "license": "MIT"
+}

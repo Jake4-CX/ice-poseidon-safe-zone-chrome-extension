@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output (attach the packaged zip to a GitHub release instead)
+extension/dist/
+release/
+*.zip
+
+# Secrets and local config
+.env
+.env.*
+
+# Private working notes
+context/
+
+# Decompiled site bundles from `npm run site:pull` (third-party code, don't publish)
+.site/
+
+# Raw live-feed recordings from `npm run capture`
+captures/
+
+# Logs and OS/editor clutter
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

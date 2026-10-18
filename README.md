@@ -19,8 +19,10 @@ Chrome extension built on that client.
    and pick the unzipped folder (the one containing `manifest.json`).
 4. Open <https://iceposeidon.com/safezone/map>. The SafeZone+ panel appears on the map.
 
-To update, download the new zip, replace the folder's contents and press ↻ on the extension
-in `chrome://extensions`. Works in Chromium browsers (Chrome, Edge, Brave) version 111+.
+SafeZone+ checks this repo for new versions and shows a notice in its panel (plus **NEW** on the
+toolbar icon) when one is out. Chrome can't update an unpacked extension by itself, so to update,
+download the new zip, replace the folder's contents and press ↻ on the extension in
+`chrome://extensions`. Works in Chromium browsers (Chrome, Edge, Brave) version 111+.
 
 ## Features
 
@@ -36,6 +38,10 @@ Chrome extension (adds a panel to `/safezone/map`):
 - **Alerts for favourites.** Eliminated, big damage or low HP, left the zone, poisoned, drone inbound, chased by zombies, missile or nuke targeting them, mock GPS. Shown in the map's top-left corner (clicking one jumps to the player) and as optional desktop notifications. Each alert type can be turned on or off.
 - **At a glance.** HP bar, metres inside or outside the zone edge, location age, poison and drone countdowns, zombie chasers and nearest distance, incoming projectiles.
 - **Filters.** Favourites, Alive, Outside zone, Low HP, Chased, Eliminated.
+- **Contestant info.** Inventory, sigil and the activity log from the site's player card, right in the player's details. When the site opens its own card, SafeZone+'s actions (★, Watch, Kick, locate) appear inside it.
+- **Multiple zones.** When the event runs several safe zones, distances, edge ETAs and the forecast use their combined area (safe inside any of them).
+- **More map room (optional).** *Settings → Site* tucks the site's header away. Move the pointer to the top edge, or click the small tab, to get the tabs and your account menu back.
+- **Blackouts (optional).** An EMP is meant to blind contestants, not viewers. Turn on *Settings → Blackouts* to keep seeing players during one; anyone whose position stops updating stays at their last known spot (dashed).
 - **Details.** Coordinates with a Google Maps link, distance and direction to the zone centre, whether the player will still be inside after the current shrink, and nearby zombies, chests and items.
 
 ## Screenshots
@@ -80,6 +86,16 @@ npm run package:ext   # → release/safezone-plus-v<version>.zip (attach to a Gi
 To run a local build, **Load unpacked** → select `extension/dist`.
 Use `npm run watch:ext` while developing, and reload the extension after each change.
 
+## Releasing
+
+1. Bump `version` in `extension/manifest.json` (and `package.json`).
+2. `npm run package:ext` builds `release/safezone-plus-v<version>.zip` and syncs `version.json`.
+   Write a one-line summary in its `notes`.
+3. Publish a GitHub release (tag `v<version>`) with the zip attached.
+4. **Then** commit and push `version.json` to `main`. Installed copies poll
+   `raw.githubusercontent.com/.../main/version.json` every few hours, so pushing it earlier would
+   announce an update nobody can download yet.
+
 ## How it works
 
 The map's live feed is a public WebSocket that mixes JSON frames with a custom columnar binary
@@ -109,10 +125,10 @@ socket in that case.
 
 ### Respecting the game's restrictions
 
-During an EMP or smoke **blackout**, while the map is **anonymous**, or while the public map is
-disabled, SafeZone+ hides positions, health and map labels, the same way the site does. These
-restrictions are only enforced in the site's client code (see PROTOCOL.md), so this is a
-deliberate choice.
+While the map is **anonymous** or the public map is disabled, SafeZone+ hides positions, health
+and map labels, the same way the site does. During an EMP or smoke **blackout** it does the same
+by default. Per the event developer, the EMP is meant to stop contestants seeing each other
+rather than viewers, so *Settings → Blackouts* can keep players visible.
 
 ## Status / next ideas
 

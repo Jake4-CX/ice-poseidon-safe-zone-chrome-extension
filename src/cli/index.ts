@@ -17,13 +17,15 @@ import {
   compass,
   describeNearby,
   distanceM,
-  edgeMarginM,
   fetchKickChannel,
   fetchSnapshotFrames,
   formatDistance,
   formatDuration,
   guessKickSlug,
   kickChannelUrl,
+  nearestCircle,
+  unionMarginM,
+  STATIONARY_MPS,
   zoneAt,
   zoneTarget,
   type Player,
@@ -56,11 +58,11 @@ function hpBar(p: Player): string {
 }
 
 function oneLine(state: SafeZoneState, p: Player): string {
-  const zone = state.safeZone();
   const now = state.now();
+  const circles = state.safeZones().map((z) => zoneAt(z, now));
   const parts = [c.bold(p.username.padEnd(22)), hpBar(p)];
-  if (p.location && zone) {
-    const m = edgeMarginM(p.location, zoneAt(zone, now));
+  const m = p.location ? unionMarginM(p.location, circles) : null;
+  if (m !== null) {
     parts.push(m >= 0 ? c.green(`${formatDistance(m)} inside`) : c.red(`${formatDistance(m)} OUTSIDE`));
   } else parts.push(c.dim("no location"));
   if (p.location) parts.push(c.dim(`updated ${formatDuration(now - p.location.recordedAt)} ago`));
@@ -83,12 +85,12 @@ function detail(state: SafeZoneState, p: Player): string {
   if (loc) {
     lines.push(`  position: ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)} ±${loc.accuracyM}m${loc.mock ? c.red(" (MOCK GPS)") : ""}`);
     lines.push(c.dim(`  https://www.google.com/maps?q=${loc.lat},${loc.lng}`));
-    const zone = state.safeZone();
-    if (zone) {
-      const center = zoneAt(zone, now);
-      lines.push(`  zone centre: ${formatDistance(distanceM(loc, center))} ${compass(bearingDeg(loc, center))}`);
-      if (zone.transition) {
-        const m = edgeMarginM(loc, zoneTarget(zone));
+    const zones = state.safeZones();
+    const center = nearestCircle(loc, zones.map((z) => zoneAt(z, now)));
+    if (center) {
+      lines.push(`  ${zones.length > 1 ? "nearest zone centre" : "zone centre"}: ${formatDistance(distanceM(loc, center))} ${compass(bearingDeg(loc, center))}`);
+      if (zones.some((z) => z.transition)) {
+        const m = unionMarginM(loc, zones.map(zoneTarget))!;
         lines.push(`  after current shrink: ${m >= 0 ? c.green(formatDistance(m) + " inside") : c.red(formatDistance(m) + " outside")}`);
       }
     }
@@ -134,12 +136,13 @@ async function cmdStats() {
   const state = await loadSnapshot();
   const players = state.players();
   const alive = players.filter((p) => p.status?.alive && p.status.status !== "eliminated");
-  const zone = state.safeZone();
   const now = state.now();
   console.log(c.bold("Safe Zone"), `upstream: ${state.event?.upstream ?? "?"}`, `clock: ${state.event?.game?.clock ?? "?"}`, state.blackout ? c.red(`BLACKOUT (${state.blackout.source}) until ${state.blackout.until}`) : "");
-  if (zone) {
+  const zones = state.movingZones();
+  for (const { zone, motion } of zones) {
     const g = zoneAt(zone, now);
-    console.log(`zone: r=${Math.round(g.radius)}m at ${g.lat.toFixed(5)},${g.lng.toFixed(5)}${zone.transition ? c.yellow(` → shrinking to ${Math.round(zone.transition.to.radius)}m by ${zone.transition.ends_at}`) : ""}`);
+    const drift = motion && motion.speedMps >= STATIONARY_MPS ? c.dim(` drifting ${compass(motion.headingDeg)} ${(motion.speedMps * 3.6).toFixed(1)} km/h`) : "";
+    console.log(`zone${zones.length > 1 ? " (one of " + zones.length + ", safe inside any)" : ""}: r=${Math.round(g.radius)}m at ${g.lat.toFixed(5)},${g.lng.toFixed(5)}${zone.transition ? c.yellow(` → shrinking to ${Math.round(zone.transition.to.radius)}m by ${zone.transition.ends_at}`) : ""}${drift}`);
   }
   console.log(`players: ${players.length} registered, ${c.green(String(alive.length))} alive, ${c.red(String(players.length - alive.length))} out, ${players.filter((p) => state.isStale(p, now)).length} without fresh location`);
   console.log(`zombies: ${state.zombies().length}, projectiles in flight: ${state.projectiles.length}, items on map: ${state.items.length}`);

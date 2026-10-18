@@ -17,6 +17,22 @@ export interface MapMarker {
   dead?: boolean;
 }
 
+/**
+ * A player drawn by SafeZone+ itself while the site hides its own sprites (blackout with
+ * "show players during blackouts" on). `live` = position still updating; otherwise frozen.
+ */
+export interface GhostMarker {
+  id: string;
+  lat: number;
+  lng: number;
+  label: string;
+  avatar: string | null;
+  live: boolean;
+  /** "4m" for frozen positions. */
+  age: string | null;
+  dead: boolean;
+}
+
 export interface PlayerPoint {
   id: string;
   lat: number;
@@ -32,12 +48,14 @@ export type ToPage =
   | { type: "players"; players: PlayerPoint[] }
   /** Players whose on-screen position should be reported (action bar, pinned stream). */
   | { type: "anchors"; ids: string[] }
+  /** Players to draw ourselves where the site isn't drawing a sprite; [] turns this off. */
+  | { type: "ghosts"; ghosts: GhostMarker[] }
   /** Zone forecast drawn as native map layers; null clears it. */
   | { type: "zoneForecast"; forecast: ZoneForecast | null }
   | { type: "ping" };
 
 export interface ZoneForecast {
-  /** GeoJSON FeatureCollection; features carry `kind: "future" | "path"`. */
+  /** GeoJSON FeatureCollection; features carry `kind: "future" | "outline" | "path"`. */
   geojson: { type: "FeatureCollection"; features: object[] };
   label: { lat: number; lng: number; text: string };
 }
@@ -56,7 +74,29 @@ export type ToContent =
 export type ToBackground =
   | { type: "kick"; slug: string; expectedUserId: number | null }
   | { type: "notify"; id: string; title: string; message: string }
-  | { type: "openMap" };
+  | { type: "openMap" }
+  /** Compare this build with version.json on GitHub (cached for a few hours unless forced). */
+  | { type: "checkUpdate"; force?: boolean };
+
+/** version.json at the root of the GitHub repo. */
+export interface ReleaseInfo {
+  version: string;
+  /** ISO date. */
+  released?: string;
+  /** One-line summary shown in the update notice. */
+  notes?: string;
+  /** Where to download the new zip. */
+  download?: string;
+}
+
+export interface UpdateStatus {
+  current: string;
+  latest: ReleaseInfo | null;
+  /** latest.version > current */
+  available: boolean;
+  checkedAt: number;
+  error?: string;
+}
 
 export type KickResponse = { ok: true; channel: KickChannelInfo | null } | { ok: false; error: string };
 
@@ -76,6 +116,15 @@ export interface Settings {
   forecastMinutes: number;
   /** Zoom used when jumping to a player. */
   locateZoom: number;
+  /**
+   * Keep showing players while an EMP/smoke blackout hides them on the site. The EMP is meant
+   * to blind contestants, not viewers (confirmed by the event developer).
+   */
+  showDuringBlackout: boolean;
+  /** Show inventory, sigil and activity from the site's contestant card in player details. */
+  contestantInfo: boolean;
+  /** Tuck the site's header (logo, tabs, account) away; it slides back in on demand. */
+  hideHeader: boolean;
 }
 
 export const ALERT_KIND_LABELS: Record<AlertKind, string> = {
@@ -114,6 +163,9 @@ export const DEFAULT_SETTINGS: Settings = {
   zoneForecast: true,
   forecastMinutes: 10,
   locateZoom: 17,
+  showDuringBlackout: false,
+  contestantInfo: true,
+  hideHeader: false,
 };
 
 export interface Favourite {

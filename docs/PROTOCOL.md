@@ -25,6 +25,13 @@ polls, robot control. These GETs work anonymously (checked 2026-10-17):
 - `GET /public/event/predictions` → `{ markets: [] }`
 - `GET /public/polls/sigil` → `{ results: [{ sigil, percent }] }`
 
+Contestant activity (shown in the site's player card, polled every 15s while it's open):
+
+- `GET https://event-api.iceposeidon.com/public/event/contestants/:rosterId/damage-log?limit=30`
+  → `{ visible, entries: [{id, at, category, text, hp_before, hp_after, icon}], next_before }`.
+  CORS allows `https://iceposeidon.com`; CDN cached 30s. Scripted clients are asked to send an
+  identifying User-Agent with contact details.
+
 ## Text frames (JSON)
 
 `{ "type": ..., "data": ... }`. See `src/core/messages.ts` for the full types.
@@ -33,10 +40,14 @@ polls, robot control. These GETs work anonymously (checked 2026-10-17):
 | --- | --- | --- |
 | `event` | `{ upstream: "live"\|"down", map: {enabled, anonymous, location_stale_after_ms, damage, blackout}, game: {clock, chest_items, minigames, zombie_speed_mps, ...} }` | Replaces the previous value |
 | `contestants` | `{ roster: {stale, stats_visible, contestants[]} \| null, slots: {definition_sequence, slots: [{slot, user_id, username, avatar_url}]} \| null }` | **Slots map the numeric slot ids used by binary frames to users.** `definition_sequence` must match the binary frames' `definitionSequence`. |
-| `map_objects` / `map_objects_patch` | objects: `safe_zone` (with optional `transition {from,to,started_at,ends_at,paused_at}`), `circle`, `text`, `image`, `claimable` (chests) | Patch = `{upsert[], remove[]}` by id. The zone moves through frequent patches. |
+| `map_objects` / `map_objects_patch` | objects: `safe_zone` (with optional `transition {from,to,started_at,ends_at,paused_at}`), `circle`, `text`, `image`, `claimable` (chests) | Patch = `{upsert[], remove[]}` by id. The zone moves through frequent patches. **There can be several `safe_zone` objects**; the safe area is their union. |
+| `tracked_devices` | `[{id, name, image_url, icon_px, lat, lng, accuracy_m, heading_deg, recorded_at}]` | Non-contestant trackers drawn on the map (e.g. a camera crew). Hidden by the site during a blackout. |
 | `game_items` / `game_items_patch` | `{ items: GameItem[], last_known: [{user_id, lat, lng, recorded_at}] }` | Items: gravestone, dropped_item, unsafe_zone, c4, claymore, bubble, tear_gas, crate, care_package_drop, fake_chest, fake_gravestone, ... |
 | `explosions` | `[{id, kind, lat, lng, radius_m, at}]` | Transient. The site keeps them for 10s. |
 | `heartbeat` | `{ server_time? }` | Clock sync |
+
+Roster contestants (since 2026-10-18) also carry `sigil` and `inventory: [{item: {type, ...stats}, label, icon: {url, badge, alt}, slot_key, stealable}]`.
+The site only shows them while `roster.stats_visible` is true.
 
 Usernames are **Kick usernames** (users log in with Kick). `avatar_url` is
 `https://data.cx-live.com/v1/kick/avatars?id=<kick user id>&size=64`, and that id equals
@@ -152,7 +163,8 @@ F+2L+4j   i32 nextHitAt    ×100ms + timeBase
 
 3 = entity positions (needs an `entity_definitions` JSON stream that the public socket doesn't send),
 5 = "motion"/nearby players, 6 = own health overlay. 5 and 6 are personal and only sent on
-authenticated sockets. The public client ignores all three.
+authenticated sockets. The public client ignores all three. Kind 6 also carries the contestant's
+own `blackout {source: emp|smoke, until}`: an EMP blinds the *contestants'* map.
 
 ## Client-side-only restrictions
 
@@ -164,7 +176,9 @@ These are enforced in the site's JavaScript, not on the server:
 - **Anonymous** (`event.map.anonymous`): the site shows "Contestants are anonymous". What the
   server sends in this mode is unverified.
 
-SafeZone+ mirrors both restrictions by default.
+SafeZone+ mirrors both by default. The event developer confirmed the EMP is meant to stop
+contestants seeing each other, not viewers, so Settings → Blackouts can keep players visible
+during one. SafeZone+ then draws them itself, at their last received position if updates stop.
 
 ## Observed behaviour
 

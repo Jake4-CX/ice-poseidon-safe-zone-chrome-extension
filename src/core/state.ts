@@ -23,7 +23,7 @@ import {
 import { fuzzySearch } from "./search.js";
 import { kickUserIdFromAvatar } from "./kick.js";
 import { zoneAt } from "./geo.js";
-import { ZoneTracker, type ZoneMotion } from "./zone.js";
+import { ZoneTracker, type MovingZone, type ZoneMotion } from "./zone.js";
 
 export interface PlayerDeath {
   /** Unix ms. */
@@ -62,6 +62,11 @@ export interface Player {
   username: string;
   avatarUrl: string | null;
   kickUserId: number | null;
+  /**
+   * Last position ever received, kept even when the server clears locations (e.g. during a
+   * blackout) or the client resyncs. Equals `location` while that is present.
+   */
+  lastSeen: PlayerLocation | null;
   /** Curated roster entry (kick slug, live flag) when the server provides one. */
   roster: RosterContestant | null;
   location: PlayerLocation | null;
@@ -116,7 +121,9 @@ export class SafeZoneState {
   /** serverTime - localTime, from heartbeats. */
   clockOffsetMs = 0;
   lastMessageAt = 0;
-  readonly zoneTracker = new ZoneTracker();
+  /** One drift estimator per safe zone id (the server can run several zones at once). */
+  private zoneTrackers = new Map<string, ZoneTracker>();
+  private lastSeen = new Map<string, PlayerLocation>();
   /** Deaths are kept even after the gravestone disappears (looted/expired). */
   private deaths = new Map<string, PlayerDeath>();
   private latestSampledAt = 0;
@@ -250,9 +257,14 @@ export class SafeZoneState {
   }
 
   private observeZone() {
-    const zone = this.safeZone();
     const t = this.streamTime();
-    if (zone) this.zoneTracker.observe(t, zoneAt(zone, t));
+    const zones = this.safeZones();
+    for (const zone of zones) {
+      let tracker = this.zoneTrackers.get(zone.id);
+      if (!tracker) this.zoneTrackers.set(zone.id, (tracker = new ZoneTracker()));
+      tracker.observe(t, zoneAt(zone, t));
+    }
+    for (const id of this.zoneTrackers.keys()) if (!zones.some((z) => z.id === id)) this.zoneTrackers.delete(id);
   }
 
   private recordGraves() {
@@ -289,13 +301,15 @@ export class SafeZoneState {
           const prev = this.locations.get(s.user_id);
           if (fix.at === null && !prev) continue;
           if (fix.at !== null) this.watermarks.set(s.user_id, fix.at);
-          this.locations.set(s.user_id, {
+          const loc = {
             lat: fix.lat,
             lng: fix.lng,
             accuracyM: fix.accuracyM,
             recordedAt: fix.at ?? prev!.recordedAt,
             mock: fix.mock,
-          });
+          };
+          this.locations.set(s.user_id, loc);
+          this.lastSeen.set(s.user_id, loc);
         }
         if (f.header.mode !== "sparse") {
           for (const id of this.locations.keys()) if (!seen.has(id)) this.locations.delete(id);
@@ -363,13 +377,51 @@ export class SafeZoneState {
     return this.event?.map?.location_stale_after_ms ?? 120_000;
   }
 
-  safeZone(): SafeZoneObject | undefined {
-    return this.mapObjects.find((o): o is SafeZoneObject => o.type === "safe_zone");
+  /** Every player's last received position, for persisting across page loads. */
+  exportLastSeen(): Record<string, PlayerLocation> {
+    return Object.fromEntries(this.lastSeen);
   }
 
-  /** Estimated zone drift (needs ~15s of updates after connecting). */
+  /**
+   * Restore remembered positions (e.g. after reloading the page during a blackout, when the
+   * server sends none). Never overrides a newer position received in this session.
+   */
+  seedLastSeen(entries: Record<string, PlayerLocation>): void {
+    let changed = false;
+    for (const [id, loc] of Object.entries(entries)) {
+      const cur = this.lastSeen.get(id);
+      if (cur && cur.recordedAt >= loc.recordedAt) continue;
+      this.lastSeen.set(id, loc);
+      changed = true;
+    }
+    if (changed) {
+      this.mark("locations");
+      this.flush();
+    }
+  }
+
+  /** Every safe zone. The safe area is their union: a player is safe inside any of them. */
+  safeZones(): SafeZoneObject[] {
+    return this.mapObjects.filter((o): o is SafeZoneObject => o.type === "safe_zone");
+  }
+
+  /** The largest safe zone (the "main" one when there are several). */
+  safeZone(): SafeZoneObject | undefined {
+    const now = this.now();
+    let best: SafeZoneObject | undefined;
+    for (const z of this.safeZones()) if (!best || zoneAt(z, now).radius > zoneAt(best, now).radius) best = z;
+    return best;
+  }
+
+  /** Each zone with its estimated drift (needs ~15s of updates after connecting). */
+  movingZones(): MovingZone[] {
+    return this.safeZones().map((zone) => ({ zone, motion: this.zoneTrackers.get(zone.id)?.motion() ?? null }));
+  }
+
+  /** Drift of the main zone (see {@link safeZone}); zones observed so far move in lockstep. */
   zoneMotion(): ZoneMotion | null {
-    return this.zoneTracker.motion();
+    const zone = this.safeZone();
+    return zone ? (this.zoneTrackers.get(zone.id)?.motion() ?? null) : null;
   }
 
   players(): Player[] {
@@ -385,6 +437,7 @@ export class SafeZoneState {
         kickUserId: kickUserIdFromAvatar(s.avatar_url),
         roster: rosterByUser.get(s.user_id) ?? null,
         location: this.locations.get(s.user_id) ?? null,
+        lastSeen: this.lastSeen.get(s.user_id) ?? null,
         lastKnown: lk ? { lat: lk.lat, lng: lk.lng, recordedAt: Date.parse(lk.recorded_at) } : null,
         status: this.statuses.get(s.user_id) ?? null,
         death: this.deaths.get(s.user_id) ?? null,

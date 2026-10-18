@@ -63,6 +63,8 @@ export interface UiState {
   collapsed: boolean;
   filter: string;
   stream: StreamUi;
+  /** Update notice the user closed (shown again for newer versions). */
+  dismissedUpdate: string | null;
 }
 const DEFAULT_UI: UiState = {
   x: null,
@@ -70,6 +72,7 @@ const DEFAULT_UI: UiState = {
   collapsed: false,
   filter: "favourites",
   stream: { x: null, y: null, w: 400, pinned: false, muted: true },
+  dismissedUpdate: null,
 };
 
 export async function loadUi(): Promise<UiState> {

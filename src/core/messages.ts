@@ -66,12 +66,40 @@ export interface RosterContestant {
   name: string;
   avatar_url: string | null;
   eliminated_at: IsoDate | null;
+  /** e.g. "endurance", "piety". Only sent while roster stats are visible. */
   sigil: string | null;
-  inventory: unknown[] | null;
+  inventory: InventoryEntry[] | null;
   kick_slug: string | null;
   live: boolean;
   /** Links to Slot.user_id. */
   map_user_id: string | null;
+}
+
+export interface InventoryEntry {
+  /** `type` plus item-specific stats (duration_seconds, radius_m, ...). */
+  item: { type: string; [k: string]: unknown };
+  label: string;
+  icon: { url: string; badge: string | null; alt: string } | null;
+  slot_key: string | null;
+  stealable: boolean;
+}
+
+/** GET event-api.iceposeidon.com/public/event/contestants/:id/damage-log?limit=N */
+export interface ActivityLog {
+  visible: boolean;
+  entries: ActivityEntry[];
+  next_before: string | null;
+}
+
+export interface ActivityEntry {
+  id: string;
+  at: IsoDate;
+  /** "action" | "effect" | "attack" | "damage" | ... */
+  category: string;
+  text: string;
+  hp_before: number | null;
+  hp_after: number | null;
+  icon: { url: string; badge: string | null; alt: string } | null;
 }
 
 export interface ContestantsMessage {

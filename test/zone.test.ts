@@ -7,6 +7,8 @@ import {
   destination,
   distanceM,
   edgeEta,
+  edgeEtaAny,
+  fromLocalM,
   predictZone,
   type SafeZoneObject,
   type ZoneMotion,
@@ -88,4 +90,29 @@ test("deaths come from gravestones with cause and source", () => {
   const d = dead[0]!.death!;
   assert.ok(d.at > Date.parse("2026-01-01"));
   assert.ok(dead.some((p) => p.death!.source === "zone"));
+});
+
+test("edgeEtaAny: safe while inside any zone; exits only when the last one leaves", () => {
+  const centre = { lat: 30.29, lng: -97.74 };
+  const zoneAt = (id: string, eastM: number, radius: number) => {
+    const p = fromLocalM(centre, eastM, 0);
+    return { id, type: "safe_zone" as const, lat: p.lat, lng: p.lng, radius } as SafeZoneObject;
+  };
+  const still = { vEast: 0, vNorth: 0, speedMps: 0, headingDeg: 0, radiusRateMps: 0, spanS: 60 };
+  const east1 = { ...still, vEast: 1, speedMps: 1, headingDeg: 90 };
+  // Point at the centre. Zone A (r=100) drifts east at 1 m/s: alone it would leave the point
+  // after 100s. Zone B (r=300, centred 250m west) is stationary and also covers the point.
+  const a = { zone: zoneAt("a", 0, 100), motion: east1 };
+  const b = { zone: zoneAt("b", -250, 300), motion: still };
+  const now = Date.parse("2026-10-18T19:00:00Z");
+  assert.equal(edgeEtaAny(centre, [a], now)!.ms, 100_000);
+  assert.equal(edgeEtaAny(centre, [a, b], now), null, "B keeps them safe");
+  // B drifting west at 1 m/s leaves the point after 50s, A after 100s: exit at 100s.
+  const bWest = { zone: b.zone, motion: { ...still, vEast: -1, speedMps: 1, headingDeg: 270 } };
+  assert.equal(Math.round(edgeEtaAny(centre, [a, bWest], now)!.ms), 100_000);
+  // Outside both: whichever reaches the point first.
+  const far = fromLocalM(centre, 400, 0);
+  const eta = edgeEtaAny(far, [a, bWest], now)!;
+  assert.equal(eta.kind, "enters");
+  assert.equal(Math.round(eta.ms / 1000), 300); // A's edge: 400 - 100 = 300 m at 1 m/s
 });

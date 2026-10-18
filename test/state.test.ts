@@ -99,3 +99,38 @@ test("alert engine: baseline first, then transitions", () => {
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0]!.kind, "eliminated");
 });
+
+test("several safe zones: each gets its own drift tracker, main zone = largest", () => {
+  const state = loadState();
+  const [main] = state.safeZones();
+  assert.ok(main);
+  const small = { ...main, id: "second-zone", radius: main.radius / 2, lat: main.lat + 0.01 };
+  state.ingest(JSON.stringify({ type: "map_objects_patch", data: { upsert: [small], remove: [] } }));
+  assert.equal(state.safeZones().length, 2);
+  assert.equal(state.safeZone()!.id, main.id, "largest zone is the main one");
+  assert.deepEqual(state.movingZones().map((z) => z.zone.id).sort(), [main.id, "second-zone"].sort());
+  state.ingest(JSON.stringify({ type: "map_objects_patch", data: { upsert: [], remove: ["second-zone"] } }));
+  assert.equal(state.safeZones().length, 1);
+});
+
+test("lastSeen keeps positions after the server clears locations (blackout fallback)", () => {
+  const state = loadState();
+  const before = state.players().filter((p) => p.location);
+  assert.ok(before.length > 10);
+  // Rewrite a captured location frame into an empty full|clear frame with a newer sequence.
+  const loc = frames.find((f) => typeof f !== "string" && new Uint8Array(f)[0] === 1) as ArrayBuffer;
+  const clear = new Uint8Array(loc.slice(0, 36 + 20));
+  const view = new DataView(clear.buffer);
+  view.setUint16(2, 3, true); // flags: full | clear
+  view.setUint32(8, 0xfffffff0, true); // sequence
+  view.setUint16(28, 0, true); // part index
+  view.setUint16(30, 1, true); // part count
+  view.setUint16(32, 0, true); // records
+  state.ingest(clear.buffer);
+  const after = state.players();
+  assert.equal(after.filter((p) => p.location).length, 0, "locations cleared");
+  for (const p of before) {
+    const q = after.find((x) => x.userId === p.userId)!;
+    assert.deepEqual(q.lastSeen, p.location, `${p.username} keeps their last position`);
+  }
+});

@@ -1,9 +1,10 @@
 /**
  * Service worker: Kick API lookups (content scripts can't make cross-origin requests),
- * desktop notifications, and the toolbar button.
+ * desktop notifications, the toolbar button and the update check.
  */
 import { fetchKickChannel, type KickChannelInfo } from "../../src/core/kick.js";
-import type { KickResponse, ToBackground } from "./shared.js";
+import type { KickResponse, ToBackground, UpdateStatus } from "./shared.js";
+import { checkForUpdate } from "./update.js";
 
 const MAP_URL = "https://iceposeidon.com/safezone/map";
 const KICK_TTL_MS = 2 * 60_000;
@@ -59,6 +60,9 @@ chrome.runtime.onMessage.addListener((msg: ToBackground, sender, sendResponse) =
     case "openMap":
       void openMap();
       return false;
+    case "checkUpdate":
+      updateCheck(msg.force).then(sendResponse, (e: Error) => sendResponse({ current: chrome.runtime.getManifest().version, latest: null, available: false, checkedAt: Date.now(), error: e.message } satisfies UpdateStatus));
+      return true;
   }
   return false;
 });
@@ -77,3 +81,17 @@ chrome.notifications.onClicked.addListener(async (id) => {
 });
 
 chrome.action.onClicked.addListener(() => void openMap());
+
+/** Check GitHub for a newer release and flag the toolbar icon when there is one. */
+async function updateCheck(force = false): Promise<UpdateStatus> {
+  const status = await checkForUpdate(chrome.runtime.getManifest().version, force);
+  await chrome.action.setBadgeText({ text: status.available ? "NEW" : "" });
+  if (status.available) {
+    await chrome.action.setBadgeBackgroundColor({ color: "#16a34a" });
+    await chrome.action.setTitle({ title: `SafeZone+ ${status.latest!.version} is available. Click to open the map.` });
+  }
+  return status;
+}
+
+chrome.runtime.onStartup.addListener(() => void updateCheck());
+chrome.runtime.onInstalled.addListener(() => void updateCheck(true));

@@ -90,6 +90,30 @@ export function edgeMarginM(point: LatLng, circle: CircleGeometry): number {
   return circle.radius - distanceM(point, circle);
 }
 
+/**
+ * Margin against the union of several circles (the safe area when the server runs more than
+ * one safe zone). Outside: exact distance to the nearest circle (negative). Inside: depth
+ * inside the deepest circle, a lower bound on the distance to the union's outer edge.
+ */
+export function unionMarginM(point: LatLng, circles: CircleGeometry[]): number | null {
+  if (!circles.length) return null;
+  return Math.max(...circles.map((c) => edgeMarginM(point, c)));
+}
+
+/** The circle a point is deepest inside (or closest to, when outside all of them). */
+export function nearestCircle<T extends CircleGeometry>(point: LatLng, circles: T[]): T | null {
+  let best: T | null = null;
+  let bestM = -Infinity;
+  for (const c of circles) {
+    const m = edgeMarginM(point, c);
+    if (m > bestM) {
+      bestM = m;
+      best = c;
+    }
+  }
+  return best;
+}
+
 export function formatDistance(m: number): string {
   const a = Math.abs(m);
   return a >= 1000 ? `${(a / 1000).toFixed(a >= 10000 ? 0 : 1)} km` : `${Math.round(a)} m`;

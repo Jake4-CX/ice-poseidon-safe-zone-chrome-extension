@@ -6,9 +6,13 @@
  * Rings are drawn in our own overlay and re-positioned every animation frame from the
  * renderer's per-sprite boxes, so they sit on the real (smoothed) sprite and disappear when it
  * isn't drawn. Without the renderer we fall back to the raw GPS point.
+ *
+ * "Ghosts" are players we draw ourselves (avatar dot + name) while the site hides its sprites
+ * during a blackout and the user opted to keep seeing them. In ghost mode, rings, anchors and
+ * click hit-testing also fall back to GPS for any player the site isn't drawing.
  */
 import { discoverMap, findRenderers, spriteGeom, type CxRenderer, type MlMap, type MlMapEvent, type SpriteGeom } from "./map-discovery.js";
-import { TO_CONTENT, TO_PAGE, type MapMarker, type PlayerPoint, type ToContent, type ToPage, type ZoneForecast } from "./shared.js";
+import { TO_CONTENT, TO_PAGE, type GhostMarker, type MapMarker, type PlayerPoint, type ToContent, type ToPage, type ZoneForecast } from "./shared.js";
 
 let map: MlMap | null = null;
 let renderers: CxRenderer[] = [];
@@ -18,6 +22,8 @@ let players: PlayerPoint[] = [];
 let following: string | null = null;
 let pending: ToPage | null = null;
 let forecast: ZoneForecast | null = null;
+let ghosts: GhostMarker[] = [];
+const ghostMode = () => ghosts.length > 0;
 const anchorIds = new Set<string>();
 const lastAnchor = new Map<string, string>();
 let frame = 0;
@@ -73,6 +79,21 @@ function injectStyle() {
       70% { box-shadow: 0 0 0 10px transparent, inset 0 0 6px var(--c); }
       100% { box-shadow: 0 0 0 0 transparent, inset 0 0 6px var(--c); }
     }
+    .szp-gh { position: absolute; left: 0; top: 0; pointer-events: none; will-change: transform; }
+    .szp-gh .szp-gav {
+      position: absolute; left: -14px; top: -14px; width: 28px; height: 28px; border-radius: 50%;
+      box-sizing: border-box; border: 2px solid #22ff00; background: #111 center / cover no-repeat;
+      box-shadow: 0 0 0 1px #000, 0 1px 4px rgba(0,0,0,.6);
+      font: 700 12px/24px system-ui, sans-serif; color: #fff; text-align: center;
+    }
+    .szp-gh .szp-gname {
+      position: absolute; left: 0; top: 16px; transform: translateX(-50%); white-space: nowrap;
+      font: 600 11px/1.2 system-ui, sans-serif; color: #fff; padding: 1px 6px; border-radius: 999px;
+      background: rgba(0,0,0,.75);
+    }
+    .szp-gh.frozen .szp-gav { border: 2px dashed #a3a3a3; filter: grayscale(.7); opacity: .8; }
+    .szp-gh.frozen .szp-gname { color: #d4d4d4; }
+    .szp-gh.dead { opacity: .4; }
     .szp-fc-label {
       position: absolute; left: 0; top: 0; white-space: nowrap; pointer-events: none;
       font: 600 12px/1.2 system-ui, sans-serif; color: #dcfce7; padding: 3px 8px; border-radius: 999px;
@@ -85,6 +106,7 @@ function injectStyle() {
 
 const onRender = () => {
   positionForecastLabel();
+  positionGhosts();
   if (forecast && !forecastReady) ensureForecast();
 };
 const onDragStart = (e: MlMapEvent) => {
@@ -104,6 +126,19 @@ const onClick = (e: MlMapEvent) => {
     if (hit && players.some((p) => p.id === hit)) {
       id = hit;
       break;
+    }
+  }
+  if (!id && ghostMode()) {
+    // Our own dots, centred on the GPS point.
+    let bestD = 18 * 18;
+    for (const g of ghosts) {
+      if (geomOf(g.id)) continue;
+      const q = map.project([g.lng, g.lat]);
+      const d = (e.point.x - q.x) ** 2 + (e.point.y - q.y) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        id = g.id;
+      }
     }
   }
   if (!id && !renderers.length) {
@@ -135,8 +170,10 @@ function attach(m: MlMap) {
   overlay.style.cssText = "position:absolute;inset:0;pointer-events:none;z-index:1;overflow:hidden;";
   m.getContainer().appendChild(overlay);
   markerEls.clear();
+  ghostEls.clear();
   renderers = findRenderers(m);
   renderMarkers();
+  renderGhosts();
   forecastReady = false;
   ensureForecast();
   send({ type: "mapStatus", found: true, native: renderers.length > 0 });
@@ -164,6 +201,7 @@ function detach() {
   forecastLabel = null;
   map = null;
   markerEls.clear();
+  ghostEls.clear();
   if (following) {
     following = null;
     send({ type: "followStopped", reason: "map-lost" });
@@ -229,7 +267,7 @@ function positionMarkers() {
     let placed: string;
     if (g) {
       placed = `${Math.round(g.x)}:${Math.round(g.y)}:${Math.round(g.d + 12)}:n`;
-    } else if (g === null) {
+    } else if (g === null && !ghostMode()) {
       placed = "hidden";
     } else {
       // Renderer doesn't draw this player (or wasn't found): raw GPS point with a name label.
@@ -250,6 +288,68 @@ function positionMarkers() {
   }
 }
 
+// ------------------------------------------------------------------ ghosts (blackout fallback)
+
+const ghostEls = new Map<string, { el: HTMLDivElement; key: string; placed: string }>();
+
+function renderGhosts() {
+  if (!overlay) return;
+  const keep = new Set(ghosts.map((g) => g.id));
+  for (const [id, g] of ghostEls) {
+    if (!keep.has(id)) {
+      g.el.remove();
+      ghostEls.delete(id);
+    }
+  }
+  for (const g of ghosts) {
+    let entry = ghostEls.get(g.id);
+    if (!entry) {
+      const el = document.createElement("div");
+      el.innerHTML = '<div class="szp-gav"></div><div class="szp-gname"></div>';
+      el.style.visibility = "hidden";
+      overlay.prepend(el); // beneath the highlight rings
+      entry = { el, key: "", placed: "" };
+      ghostEls.set(g.id, entry);
+    }
+    const key = [g.label, g.avatar, g.live, g.age, g.dead].join("|");
+    if (key !== entry.key) {
+      entry.key = key;
+      entry.el.className = "szp-gh" + (g.live ? "" : " frozen") + (g.dead ? " dead" : "");
+      const av = entry.el.firstElementChild as HTMLElement;
+      av.style.backgroundImage = g.avatar ? 'url("' + g.avatar.replace(/["\\]/g, "") + '")' : "";
+      av.textContent = g.avatar ? "" : g.label.slice(0, 1).toUpperCase();
+      // ⏸ = not moving: no position update since this one.
+      (entry.el.lastElementChild as HTMLElement).textContent = g.live ? g.label : "⏸ " + g.label + " · " + (g.age ?? "?") + " ago";
+      entry.el.title = g.live ? "" : g.label + " has not reported a position for " + (g.age ?? "a while") + ": shown where they were last seen";
+    }
+  }
+  positionGhosts();
+}
+
+/** Ghosts follow the map; each hides wherever the site draws that player's real sprite. */
+function positionGhosts() {
+  if (!map || !ghostEls.size) return;
+  const byId = new Map(ghosts.map((g) => [g.id, g]));
+  for (const [id, entry] of ghostEls) {
+    const g = byId.get(id);
+    if (!g) continue;
+    let placed = "hidden";
+    if (!geomOf(id)) {
+      const q = map.project([g.lng, g.lat]);
+      placed = Math.round(q.x) + ":" + Math.round(q.y);
+    }
+    if (placed === entry.placed) continue;
+    entry.placed = placed;
+    if (placed === "hidden") {
+      entry.el.style.visibility = "hidden";
+      continue;
+    }
+    const [x, y] = placed.split(":");
+    entry.el.style.transform = "translate(" + x + "px, " + y + "px)";
+    entry.el.style.visibility = "";
+  }
+}
+
 // ------------------------------------------------------------------ anchors (action bar, pinned stream)
 
 /** Viewport point just below the sprite (incl. its name label). */
@@ -260,7 +360,10 @@ function anchorOf(id: string): { x: number; y: number; visible: boolean } | null
     const t = r.removed ? undefined : r.tracks.get(id);
     if (!t) continue;
     // Boxes are only refreshed for sprites drawn in the latest frame.
-    if (t.placedFrame !== r.frameSerial) return { x: 0, y: 0, visible: false };
+    if (t.placedFrame !== r.frameSerial) {
+      if (ghostMode()) break; // the site isn't drawing them: anchor to our ghost dot instead
+      return { x: 0, y: 0, visible: false };
+    }
     const x = (t.box.left + t.box.right) / 2;
     const y = t.box.bottom;
     const visible = t.box.right > 0 && t.box.left < rect.width && t.box.bottom > 0 && t.box.top < rect.height;
@@ -269,7 +372,7 @@ function anchorOf(id: string): { x: number; y: number; visible: boolean } | null
   const p = players.find((pp) => pp.id === id);
   if (!p) return null;
   const q = map.project([p.lng, p.lat]);
-  return { x: rect.left + q.x, y: rect.top + q.y + 30, visible: q.x >= 0 && q.y >= 0 && q.x <= rect.width && q.y <= rect.height };
+  return { x: rect.left + q.x, y: rect.top + q.y + (ghostMode() ? 32 : 30), visible: q.x >= 0 && q.y >= 0 && q.x <= rect.width && q.y <= rect.height };
 }
 
 function reportAnchors() {
@@ -285,17 +388,18 @@ function reportAnchors() {
 
 /** Sprites glide between fixes on the site's own animation loop, so follow them every frame. */
 function frameLoop() {
-  if (!map || (!anchorIds.size && !markers.length)) {
+  if (!map || (!anchorIds.size && !markers.length && !ghosts.length)) {
     frame = 0;
     return;
   }
   positionMarkers();
+  positionGhosts();
   reportAnchors();
   frame = requestAnimationFrame(frameLoop);
 }
 
 function ensureFrameLoop() {
-  if (!frame && map && (anchorIds.size || markers.length)) frame = requestAnimationFrame(frameLoop);
+  if (!frame && map && (anchorIds.size || markers.length || ghosts.length)) frame = requestAnimationFrame(frameLoop);
 }
 
 // ------------------------------------------------------------------ zone forecast (native layers)
@@ -320,8 +424,8 @@ function ensureForecast() {
       // Below the site's custom (sprite) layers so contestants stay on top.
       const before = map.getStyle()?.layers?.find((l) => l.type === "custom")?.id;
       const isKind = (k: string) => ["==", ["get", "kind"], k];
-      map.addLayer({ id: "szp-fc-fill", type: "fill", source: FC_SOURCE, filter: isKind("future"), paint: { "fill-color": "#22ff00", "fill-opacity": 0.05 } }, before);
-      map.addLayer({ id: "szp-fc-ring", type: "line", source: FC_SOURCE, filter: isKind("future"), paint: { "line-color": "#22ff00", "line-width": 2, "line-opacity": 0.8, "line-dasharray": [3, 2] } }, before);
+      map.addLayer({ id: "szp-fc-fill", type: "fill", source: FC_SOURCE, filter: isKind("future"), paint: { "fill-color": "#22ff00", "fill-opacity": 0.04 } }, before);
+      map.addLayer({ id: "szp-fc-ring", type: "line", source: FC_SOURCE, filter: isKind("outline"), paint: { "line-color": "#22ff00", "line-width": 2, "line-opacity": 0.8, "line-dasharray": [3, 2] } }, before);
       map.addLayer({ id: "szp-fc-path", type: "line", source: FC_SOURCE, filter: isKind("path"), layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": "#22ff00", "line-width": 3, "line-opacity": 0.9 } }, before);
     } else {
       src.setData(forecast?.geojson ?? EMPTY_FC);
@@ -359,6 +463,11 @@ function handle(msg: ToPage) {
       return;
     case "players":
       players = msg.players;
+      return;
+    case "ghosts":
+      ghosts = msg.ghosts;
+      renderGhosts();
+      ensureFrameLoop();
       return;
     case "anchors":
       anchorIds.clear();

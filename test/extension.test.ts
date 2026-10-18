@@ -12,7 +12,7 @@ const dom = new JSDOM("<!doctype html><html><body><div id=map></div></body></htm
   pretendToBeVisual: true,
 });
 const g = globalThis as Record<string, unknown>;
-for (const k of ["window", "document", "HTMLElement", "Element", "Node", "CustomEvent", "Event", "KeyboardEvent", "MouseEvent", "location", "getComputedStyle"]) {
+for (const k of ["window", "document", "HTMLElement", "Element", "Node", "CustomEvent", "Event", "KeyboardEvent", "MouseEvent", "MutationObserver", "requestAnimationFrame", "cancelAnimationFrame", "location", "getComputedStyle"]) {
   g[k] = (dom.window as unknown as Record<string, unknown>)[k];
 }
 g.confirm = () => true;
@@ -196,7 +196,7 @@ test("zone forecast is sent to the bridge with heading and speed", () => {
   const fc = toPage.find((m) => m.type === "zoneForecast")?.forecast as { label: { text: string }; geojson: { features: { properties: { kind: string } }[] } };
   assert.ok(fc, "forecast sent");
   assert.match(fc.label.text, /↖ NW \d(\.\d)? km\/h · in 10 min/);
-  assert.deepEqual([...new Set(fc.geojson.features.map((f) => f.properties.kind))].sort(), ["future", "path"]);
+  assert.deepEqual([...new Set(fc.geojson.features.map((f) => f.properties.kind))].sort(), ["future", "outline", "path"]);
   assert.match($(".hstats").innerHTML, /zmove/);
 });
 
@@ -270,6 +270,216 @@ test("blackout hides positions and map markers", () => {
   assert.equal(markers.length, 0);
   state.event.map.blackout = null;
 });
+
+test("blackout bypass setting: players stay visible and the map draws ghosts for them", async () => {
+  const state = app.client.state;
+  state.event.map.blackout = { until: new Date(Date.now() + 600_000).toISOString(), source: "emp" };
+  await app.store.updateSettings({ showDuringBlackout: true });
+  toPage.length = 0;
+  app.lastGhosts = "";
+  app.onState(new Set(["event"]));
+  app.renderNow();
+  assert.match($(".banner").textContent!, /EMP blackout until .*Showing players anyway: \d+ still updating/);
+  assert.ok($(".banner").classList.contains("warn"), "banner styled as a notice, not an error");
+  assert.doesNotMatch($(".row .l2").textContent!, /hidden during blackout/);
+  const ghosts = toPage.filter((m) => m.type === "ghosts").at(-1)!.ghosts as { id: string; live: boolean; avatar: string | null }[];
+  const alive = state.players().filter((p: { status?: { alive: boolean } }) => p.status?.alive !== false && (p as { lastSeen: unknown }).lastSeen);
+  assert.ok(ghosts.length > 50 && ghosts.length <= alive.length, `ghosts for alive players (${ghosts.length})`);
+  // The state clock follows the capture, so these fixes are fresh: live ghosts, counted in the banner.
+  const liveCount = Number(/(\d+) still updating/.exec($(".banner").textContent!)![1]);
+  assert.equal(ghosts.filter((g) => g.live).length, liveCount);
+  assert.ok(liveCount > 0, "some positions still updating");
+
+  // Turning it off restores the blackout and removes the ghosts.
+  await app.store.updateSettings({ showDuringBlackout: false });
+  app.onState(new Set(["event"]));
+  app.renderNow();
+  assert.match($(".row .l2").textContent!, /hidden during blackout/);
+  assert.deepEqual(toPage.filter((m) => m.type === "ghosts").at(-1)!.ghosts, []);
+  state.event.map.blackout = null;
+  app.onState(new Set(["event"]));
+});
+
+test("multiple safe zones: header counts them, margins use the union, forecast outlines it", () => {
+  const state = app.client.state;
+  const main = state.safeZone();
+  const far = { ...main, id: "zone-2", lat: main.lat + 0.05, radius: 500 };
+  state.ingest(JSON.stringify({ type: "map_objects_patch", data: { upsert: [far], remove: [] } }));
+  app.renderNow();
+  assert.match($(".hstats").textContent!, /2 zones/);
+  // A player standing in the new zone counts as inside.
+  const p = state.players().find((x: { location: unknown }) => x.location);
+  const { byId } = app.views();
+  assert.ok(byId.get(p.userId).margin !== null, "margin computed against the union");
+  state.ingest(JSON.stringify({ type: "map_objects_patch", data: { upsert: [], remove: ["zone-2"] } }));
+});
+
+test("player details show inventory, sigil and activity like the site's card", async () => {
+  const state = app.client.state;
+  const tazo = state.search("tazo", 1)[0];
+  state.rosterStatsVisible = true;
+  const roster = {
+    id: "roster-tazo", name: "Tazo", avatar_url: null, eliminated_at: null, sigil: "endurance", kick_slug: "tazo", live: true, map_user_id: tazo.userId,
+    inventory: [{ item: { type: "emp", duration_seconds: 600 }, label: "EMP (10 min)", icon: { url: "https://files.iceposeidon.com/i/emp.png", badge: null, alt: "EMP" }, slot_key: null, stealable: true }],
+  };
+  state.roster = [roster];
+  const realFetch = g.fetch;
+  const asked: string[] = [];
+  g.fetch = async (url: string) => {
+    asked.push(url);
+    return { ok: true, json: async () => ({ visible: true, next_before: null, entries: [
+      { id: "1", at: new Date().toISOString(), category: "attack", text: "Kalkalaka set off an EMP. Their map is hidden for 10 min.", hp_before: null, hp_after: null, icon: null },
+    ] }) };
+  };
+  app.activity.clear();
+  app.expanded = tazo.userId;
+  app.renderNow();
+  await flush();
+  app.renderNow();
+  g.fetch = realFetch;
+  const details = $(".details").textContent!;
+  assert.match(details, /Sigil Endurance/);
+  assert.match(details, /EMP \(10 min\)/);
+  assert.match(details, /Kalkalaka set off an EMP/);
+  assert.equal(asked[0], "https://event-api.iceposeidon.com/public/event/contestants/roster-tazo/damage-log?limit=30");
+  state.roster = [];
+  app.expanded = null;
+});
+
+test("site's contestant card: our actions move inside it instead of overlapping", async () => {
+  const id = app.client.state.search("tazo", 1)[0].userId;
+  const fromBridge = (msg: object) =>
+    document.dispatchEvent(new dom.window.CustomEvent("szp:to-content", { detail: JSON.stringify(msg) }));
+  fromBridge({ type: "playerClicked", id });
+  fromBridge({ type: "anchor", id, x: 400, y: 300, visible: true });
+  assert.ok(!$(".card").hidden, "floating bar shown first");
+
+  // The site opens its modal for the same player.
+  const dialog = document.createElement("section");
+  dialog.setAttribute("role", "dialog");
+  dialog.innerHTML = '<div class="header"><h2>Tazo</h2></div><div class="body">Inventory…</div>';
+  document.body.appendChild(dialog);
+  await flush();
+  assert.ok($(".card").hidden, "floating bar hidden while the site card is open");
+  const strip = dialog.querySelector<HTMLElement>("[data-szp-card]");
+  assert.ok(strip, "actions injected into the site card");
+  assert.equal(strip.previousElementSibling, dialog.firstElementChild, "right below the card header");
+  const inner = strip.shadowRoot!.querySelector(".card.inline")!;
+  assert.ok(inner.querySelector('[data-act="watch"]'), "watch button in the strip");
+  toPage.length = 0;
+  (inner.querySelector('[data-act="locate"]') as HTMLElement).click();
+  assert.ok(toPage.some((m) => m.type === "flyTo"), "locate flies the map");
+
+  dialog.remove();
+  await flush();
+  assert.equal(app.cardId, null, "closing the site card closes ours too");
+});
+
+
+test("update check: compares versions, sanitises the download link, keeps the last answer on errors", async () => {
+  const { checkForUpdate, compareVersions, RELEASES_URL } = await import("../extension/src/update.js");
+  assert.equal(compareVersions("0.10.0", "0.9.3"), 1);
+  assert.equal(compareVersions("v1.2.0", "1.2.0"), 0);
+  assert.equal(compareVersions("0.2.0", "0.2.1"), -1);
+  const reply = (body: unknown, ok = true) => (async () => ({ ok, status: ok ? 200 : 500, json: async () => body })) as unknown as typeof fetch;
+  const fresh = await checkForUpdate("0.1.0", true, reply({ version: "0.2.0", notes: "New stuff", download: "https://evil.example/zip" }));
+  assert.equal(fresh.available, true, "newer version flagged");
+  assert.equal(fresh.latest!.download, RELEASES_URL, "foreign download links replaced");
+  const same = await checkForUpdate("0.2.0", true, reply({ version: "0.2.0" }));
+  assert.equal(same.available, false, "same version is up to date");
+  const failed = await checkForUpdate("0.1.0", true, reply(null, false));
+  assert.match(failed.error!, /HTTP 500/);
+  assert.equal(failed.latest!.version, "0.2.0", "last good answer kept");
+});
+
+test("update notice shows in the panel and can be dismissed for that version", () => {
+  app.update = { current: "0.1.0", latest: { version: "0.2.0", notes: "New stuff", download: "https://github.com/Jake4-CX/ice-poseidon-safe-zone-chrome-extension/releases/latest" }, available: true, checkedAt: Date.now() };
+  app.ui.dismissedUpdate = null;
+  app.renderUpdate();
+  const el = $(".update");
+  assert.ok(!el.hidden, "notice visible");
+  assert.match(el.textContent!, /SafeZone\+ 0\.2\.0 is available/);
+  (el.querySelector('[data-ui="dismiss-update"]') as HTMLElement).click();
+  assert.ok($(".update").hidden, "dismissed");
+  assert.equal(app.ui.dismissedUpdate, "0.2.0");
+});
+
+test("last positions are saved and restored, so a reload during a blackout still has them", async () => {
+  app.lastSeenSavedAt = 0;
+  app.lastSeenSaved = "";
+  app.saveLastSeen();
+  await flush();
+  const saved = storage.local.lastSeen as Record<string, import("../src/core/index.js").PlayerLocation>;
+  assert.ok(saved && Object.keys(saved).length > 50, "positions persisted");
+  const { SafeZoneState } = await import("../src/core/index.js");
+  const fresh = new SafeZoneState();
+  fresh.seedLastSeen(saved);
+  assert.equal(Object.keys(fresh.exportLastSeen()).length, Object.keys(saved).length);
+  // A newer position from this session wins over a remembered one.
+  const [id, loc] = Object.entries(saved)[0]!;
+  fresh.seedLastSeen({ [id]: { ...loc, lat: 0, recordedAt: loc.recordedAt - 1 } });
+  assert.equal(fresh.exportLastSeen()[id]!.lat, loc.lat);
+});
+
+test("hide site header: header tucked away, revealed at the top edge, restored when turned off", async () => {
+  const header = document.createElement("section");
+  header.innerHTML = "<nav>tabs</nav>";
+  const main = document.createElement("main");
+  document.body.prepend(header, main);
+  await app.store.updateSettings({ hideHeader: true });
+  const html = document.documentElement;
+  assert.ok(html.classList.contains("szp-hide-header"), "header hidden");
+  assert.ok(header.hasAttribute("data-szp-header"), "header found before <main>");
+  assert.ok(!$(".hdr-tab").hidden, "pull tab shown");
+  document.dispatchEvent(new dom.window.MouseEvent("pointermove", { clientY: 2, bubbles: true }));
+  assert.ok(html.classList.contains("szp-header-peek"), "revealed at the top edge");
+  ($(".hdr-tab") as HTMLButtonElement).click();
+  ($(".hdr-tab") as HTMLButtonElement).click();
+  assert.ok(html.classList.contains("szp-header-peek"), "tab pins it open");
+  await app.store.updateSettings({ hideHeader: false });
+  assert.ok(!html.classList.contains("szp-hide-header") && !html.classList.contains("szp-header-peek"), "restored");
+  assert.ok($(".hdr-tab").hidden, "tab hidden again");
+  header.remove();
+  main.remove();
+});
+
+test("expanded details use the full row width and clicks inside don't collapse the row", () => {
+  const p = app.client.state.search("tazo", 1)[0];
+  $<HTMLInputElement>("input").value = app.query = p.username;
+  app.expanded = p.userId;
+  app.renderNow();
+  const row = root.querySelector<HTMLElement>(`.row[data-id="${p.userId}"]`)!;
+  const more = row.querySelector<HTMLElement>(":scope > .more")!;
+  assert.ok(more.querySelector(".details"), "details live in the full-width slot");
+  assert.ok(!row.querySelector(".body .details"), "not squeezed into the name column");
+  (more.querySelector(".details .k") as HTMLElement).click();
+  assert.equal(app.expanded, p.userId, "still expanded");
+  app.expanded = null;
+  app.renderNow();
+  assert.ok(row.querySelector<HTMLElement>(":scope > .more")!.hidden, "slot hidden when collapsed");
+  $<HTMLInputElement>("input").value = app.query = "";
+});
+
+test("activity requests back off when the site answers Blocked", async () => {
+  const realFetch = g.fetch;
+  let calls = 0;
+  g.fetch = async () => {
+    calls++;
+    return { ok: false, status: 403, text: async () => '{"error":"Blocked"}' };
+  };
+  app.activity.clear();
+  app.ensureActivity("someone");
+  await flush();
+  await flush();
+  const a = app.activity.get("someone");
+  assert.equal(a.error, "blocked");
+  a.at = Date.now() - 20_000; // past the normal 15s refresh, inside the 2 min backoff
+  app.ensureActivity("someone");
+  await flush();
+  assert.equal(calls, 1, "no retry within the backoff");
+  g.fetch = realFetch;
+});
+
 
 test("map discovery walks the React fiber tree to the MapLibre instance", async () => {
   const { discoverMap } = await import("../extension/src/map-discovery.js");

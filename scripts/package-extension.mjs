@@ -28,6 +28,16 @@ const files = [];
 fs.writeFileSync(outFile, zip(files));
 console.log(`packaged ${files.length} files → ${path.relative(root, outFile)}`);
 
+// version.json (repo root) is what installed copies poll for updates. Keep its version in step
+// with the manifest; commit it only once the GitHub release with this zip is published.
+const versionFile = path.join(root, "version.json");
+const info = fs.existsSync(versionFile) ? JSON.parse(fs.readFileSync(versionFile, "utf8")) : {};
+if (info.version !== version) {
+  const next = { version, released: new Date().toISOString().slice(0, 10), notes: "", download: info.download ?? "https://github.com/Jake4-CX/ice-poseidon-safe-zone-chrome-extension/releases/latest" };
+  fs.writeFileSync(versionFile, `${JSON.stringify(next, null, 2)}\n`);
+  console.log(`version.json → ${version}: add release notes, then commit it after publishing the release`);
+}
+
 // Minimal ZIP writer (deflate, no extra fields). Timestamps are fixed so rebuilds are byte-identical.
 function zip(entries) {
   const DOS_TIME = 0, DOS_DATE = (2026 - 1980) << 9 | 1 << 5 | 1;

@@ -5,14 +5,16 @@ import {
   compass,
   describeNearby,
   distanceM,
-  edgeEta,
-  edgeMarginM,
+  edgeEtaAny,
+  nearestCircle,
+  unionMarginM,
   formatDistance,
   formatDuration,
   guessKickSlug,
   kickChannelUrl,
   zoneAt,
   zoneTarget,
+  type ActivityLog,
   type Alert,
   type ConnectionStatus,
   type EdgeEta,
@@ -25,7 +27,9 @@ import {
   ALERT_KIND_LABELS,
   TO_CONTENT,
   TO_PAGE,
+  type GhostMarker,
   type KickResponse,
+  type UpdateStatus,
   type MapMarker,
   type NotifyMode,
   type PlayerPoint,
@@ -35,6 +39,9 @@ import {
 } from "../shared.js";
 import { buildForecast, zoneMotionText } from "./forecast.js";
 import { MapToasts } from "./map-toasts.js";
+import { SiteHeader } from "./site-header.js";
+import { RELEASES_URL } from "../update.js";
+import type { PlayerLocation } from "../../../src/core/index.js";
 import { Store, loadUi, saveUi, type UiState } from "./store.js";
 import { StreamWindow } from "./stream-window.js";
 import { CSS } from "./styles.js";
@@ -69,6 +76,8 @@ const ICON = {
   external: svg('<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>'),
 };
 
+/** "now", "4m", "2h 5m": coarse enough not to change every second. */
+const ago = (ms: number) => (ms < 60_000 ? "now" : formatDuration(Math.floor(ms / 60_000) * 60_000).replace(/ 0s$/, ""));
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const timeOf = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
@@ -92,6 +101,24 @@ interface RowView {
 
 /** Show the "edge reaches them" tag when it's this close. */
 const ETA_TAG_MS = 30 * 60_000;
+
+/** The site refreshes an open contestant card's activity every 15s; so do we. */
+const ACTIVITY_TTL_MS = 15_000;
+const ACTIVITY_LIMIT = 30;
+/** After an error (the site answers "Blocked" when overloaded / rate limiting), wait longer. */
+const ACTIVITY_RETRY_MS = 2 * 60_000;
+/** Remembered positions are saved this often and restored for this long. */
+const LAST_SEEN_SAVE_MS = 20_000;
+const LAST_SEEN_MAX_AGE_MS = 6 * 3_600_000;
+const ACTIVITY_URL = (contestantId: string) =>
+  `https://event-api.iceposeidon.com/public/event/contestants/${encodeURIComponent(contestantId)}/damage-log?limit=${ACTIVITY_LIMIT}`;
+
+interface ActivityEntryState {
+  at: number;
+  log: ActivityLog | null;
+  error: string | null;
+  pending: boolean;
+}
 
 const KICK_TTL_MS = 2 * 60_000;
 const KICK_CONCURRENCY = 3;
@@ -130,6 +157,14 @@ export class App {
   private lastFollowSent = "";
   private lastMarkers = "";
   private lastPlayers = "";
+  private lastGhosts = "";
+  private siteHeader!: SiteHeader;
+  private update: UpdateStatus | null = null;
+  private lastSeenSaved = "";
+  private lastSeenSavedAt = 0;
+  private activity = new Map<string, ActivityEntryState>();
+  /** The site's own contestant card (a modal) and the player it shows, while open. */
+  private siteCard: { dialog: HTMLElement; userId: string; host: HTMLDivElement; root: ShadowRoot; key: string } | null = null;
   private mapToasts = new MapToasts((id) => this.revealPlayer(id));
   /** Player clicked on the map, shown in the floating action bar. */
   private cardId: string | null = null;
@@ -146,6 +181,8 @@ export class App {
     hstats: HTMLSpanElement;
     collapse: HTMLButtonElement;
     banner: HTMLDivElement;
+    update: HTMLDivElement;
+    headerTab: HTMLButtonElement;
     tabs: HTMLDivElement;
     playersView: HTMLDivElement;
     input: HTMLInputElement;
@@ -164,6 +201,7 @@ export class App {
     this.ui = await loadUi();
     this.buildDom();
     this.disposers.push(this.store.onChange(() => {
+      this.siteHeader.sync(this.store.settings.hideHeader);
       this.lastMarkers = "";
       this.lastForecast = "";
       this.renderSettings();
@@ -177,11 +215,21 @@ export class App {
     document.addEventListener("keydown", onKey, true);
     this.disposers.push(() => document.removeEventListener("keydown", onKey, true));
     this.disposers.push(this.client.state.onChange((c) => this.onState(c)));
+    const cardObserver = new MutationObserver(() => this.syncSiteCard());
+    cardObserver.observe(document.documentElement, { childList: true, subtree: true });
+    this.disposers.push(() => cardObserver.disconnect());
     // Countdowns ("drone lands in 12s") need ticking even without new data.
-    const tick = setInterval(() => this.scheduleRender(), 1000);
+    const tick = setInterval(() => {
+      this.scheduleRender();
+      this.siteHeader.sync(this.store.settings.hideHeader);
+      this.saveLastSeen();
+    }, 1000);
     this.disposers.push(() => clearInterval(tick));
+    await this.restoreLastSeen();
     this.client.start();
     this.toPage({ type: "ping" });
+    this.siteHeader.sync(this.store.settings.hideHeader);
+    void this.checkUpdate();
     this.renderNow();
   }
 
@@ -192,10 +240,13 @@ export class App {
     clearTimeout(this.renderTimer);
     this.toPage({ type: "markers", markers: [] });
     this.toPage({ type: "players", players: [] });
+    this.toPage({ type: "ghosts", ghosts: [] });
+    this.siteCard?.host.remove();
     this.toPage({ type: "anchors", ids: [] });
     this.toPage({ type: "zoneForecast", forecast: null });
     this.toPage({ type: "unfollow" });
     this.mapToasts.destroy();
+    this.siteHeader?.destroy();
     this.host?.remove();
   }
 
@@ -222,6 +273,7 @@ export class App {
           <button class="icon-btn" data-ui="collapse" title="Collapse"></button>
         </header>
         <div class="banner" hidden></div>
+        <div class="update" hidden></div>
         <div class="tabs">
           <button class="tab" data-tab="players">Players</button>
           <button class="tab" data-tab="alerts">Alerts</button>
@@ -236,7 +288,8 @@ export class App {
         <div class="view settings" data-view="settings" hidden></div>
         <div class="toasts"></div>
       </div>
-      <div class="card" role="dialog" aria-label="Player actions" hidden></div>`;
+      <div class="card" role="dialog" aria-label="Player actions" hidden></div>
+      <button class="hdr-tab" title="Show the site header" aria-label="Show the site header" hidden>${ICON.expand}</button>`;
     const q = <T extends Element>(sel: string) => this.root.querySelector(sel) as T;
     this.$ = {
       panel: q(".panel"),
@@ -244,6 +297,8 @@ export class App {
       hstats: q(".hstats"),
       collapse: q('[data-ui="collapse"]'),
       banner: q(".banner"),
+      update: q(".update"),
+      headerTab: q(".hdr-tab"),
       tabs: q(".tabs"),
       playersView: q('[data-view="players"]'),
       input: q("input"),
@@ -268,6 +323,7 @@ export class App {
     };
     this.$.panel.addEventListener("pointerdown", raise(this.$.panel, this.stream.el), true);
     this.stream.el.addEventListener("pointerdown", raise(this.stream.el, this.$.panel), true);
+    this.siteHeader = new SiteHeader(this.$.headerTab);
     this.applyPosition();
     this.applyCollapsed();
     this.wireEvents();
@@ -325,6 +381,17 @@ export class App {
       if ((e.target as HTMLElement).closest('[data-ui="clear-favs"]') && confirm("Remove all favourites?")) {
         void chrome.storage.sync.set({ favourites: {} });
       }
+      if ((e.target as HTMLElement).closest('[data-ui="check-update"]')) {
+        this.ui.dismissedUpdate = null;
+        saveUi(this.ui);
+        void this.checkUpdate(true);
+      }
+    });
+    this.$.update.addEventListener("click", (e) => {
+      if (!(e.target as HTMLElement).closest('[data-ui="dismiss-update"]') || !this.update?.latest) return;
+      this.ui.dismissedUpdate = this.update.latest.version;
+      saveUi(this.ui);
+      this.renderUpdate();
     });
     this.makeDraggable(panel.querySelector("header")!);
   }
@@ -400,8 +467,79 @@ export class App {
     const map = s.event?.map;
     if (map && !map.enabled) return "disabled";
     if (map?.anonymous) return "anonymous";
-    if (s.blackout && Date.parse(s.blackout.until) > s.now()) return "blackout";
+    if (this.blackoutActive && !this.store.settings.showDuringBlackout) return "blackout";
     return "normal";
+  }
+
+  private get blackoutActive(): boolean {
+    const s = this.client.state;
+    return !!s.blackout && Date.parse(s.blackout.until) > s.now();
+  }
+
+  /** Blackout active but the user chose to keep seeing players: we draw them ourselves. */
+  private get bypassing(): boolean {
+    return this.blackoutActive && this.mode === "normal";
+  }
+
+  /** Current position, or (while bypassing a blackout) the last one we ever received. */
+  private posOf(p: Player): PlayerLocation | null {
+    if (p.location || !this.bypassing) return p.location;
+    const lk = p.lastKnown;
+    const seen = p.lastSeen;
+    // The server's own "last known" (published for hidden players) if it's newer than ours.
+    if (lk && (!seen || lk.recordedAt > seen.recordedAt)) return { lat: lk.lat, lng: lk.lng, accuracyM: 0, recordedAt: lk.recordedAt, mock: false };
+    return seen;
+  }
+
+  // ------------------------------------------------------------------ remembered positions
+
+  /**
+   * Positions are persisted so that reloading the page during a blackout (when the server sends
+   * no locations at all) still shows everyone where they were last seen.
+   */
+  private async restoreLastSeen() {
+    try {
+      const { lastSeen } = (await chrome.storage.local.get("lastSeen")) as { lastSeen?: Record<string, PlayerLocation> };
+      if (!lastSeen) return;
+      const cutoff = Date.now() - LAST_SEEN_MAX_AGE_MS;
+      this.client.state.seedLastSeen(Object.fromEntries(Object.entries(lastSeen).filter(([, l]) => l.recordedAt > cutoff)));
+    } catch {
+      /* storage unavailable: nothing to restore */
+    }
+  }
+
+  private saveLastSeen() {
+    if (Date.now() - this.lastSeenSavedAt < LAST_SEEN_SAVE_MS) return;
+    this.lastSeenSavedAt = Date.now();
+    const all = this.client.state.exportLastSeen();
+    const key = Object.values(all).reduce((m, l) => Math.max(m, l.recordedAt), 0) + ":" + Object.keys(all).length;
+    if (key === this.lastSeenSaved || !Object.keys(all).length) return;
+    this.lastSeenSaved = key;
+    void chrome.storage.local.set({ lastSeen: all });
+  }
+
+  // ------------------------------------------------------------------ updates
+
+  private async checkUpdate(force = false) {
+    try {
+      this.update = await this.toBackground<UpdateStatus>({ type: "checkUpdate", force });
+    } catch {
+      return;
+    }
+    this.renderUpdate();
+    this.renderSettings();
+  }
+
+  private renderUpdate() {
+    const el = this.$.update;
+    const u = this.update;
+    const show = !!u?.available && u.latest && this.ui.dismissedUpdate !== u.latest.version;
+    el.hidden = !show;
+    if (!show || !u?.latest) return;
+    el.innerHTML =
+      `<span><b>SafeZone+ ${esc(u.latest.version)}</b> is available (you have ${esc(u.current)}).${u.latest.notes ? ` ${esc(u.latest.notes)}` : ""}</span>` +
+      `<a class="pbtn primary" href="${esc(u.latest.download ?? RELEASES_URL)}" target="_blank" rel="noopener">Download ${ICON.external}</a>` +
+      `<button class="icon-btn" data-ui="dismiss-update" title="Hide until the next version">${ICON.x}</button>`;
   }
 
   private onState(changes: Set<StateChange>) {
@@ -418,7 +556,7 @@ export class App {
       this.renderSettings();
       if (msg.found) {
         // The bridge may have (re)loaded: resend everything it needs.
-        this.lastMarkers = this.lastPlayers = this.lastForecast = this.lastAnchors = "";
+        this.lastMarkers = this.lastPlayers = this.lastForecast = this.lastAnchors = this.lastGhosts = "";
       }
       this.syncMap();
       this.scheduleRender();
@@ -457,10 +595,10 @@ export class App {
   /** Forecast of where the zone is heading, drawn natively on the map by the bridge. */
   private syncForecast() {
     const state = this.client.state;
-    const zone = state.safeZone();
+    const zones = state.movingZones();
     const s = this.store.settings;
-    const forecast = zone && s.zoneForecast && this.mode !== "disabled"
-      ? buildForecast(zone, state.zoneMotion(), state.now(), s.forecastMinutes)
+    const forecast = zones.length && s.zoneForecast && this.mode !== "disabled"
+      ? buildForecast(zones, state.now(), s.forecastMinutes)
       : null;
     const key = JSON.stringify(forecast);
     if (key === this.lastForecast) return;
@@ -507,14 +645,15 @@ export class App {
     if (visible) {
       const favs = this.store.favourites;
       for (const p of state.players()) {
-        if (!p.location) continue;
+        const pos = this.posOf(p);
+        if (!pos) continue;
         const fav = p.userId in favs;
         const focus = p.userId === this.focusId || p.userId === this.followId;
         if (!(focus || (fav && this.store.settings.mapLabels))) continue;
         markers.push({
           id: p.userId,
-          lat: p.location.lat,
-          lng: p.location.lng,
+          lat: pos.lat,
+          lng: pos.lng,
           label: p.username,
           style: fav && focus ? "fav-focus" : focus ? "focus" : "fav",
           dead: !!p.status && !p.status.alive,
@@ -527,29 +666,67 @@ export class App {
       this.toPage({ type: "markers", markers });
     }
     const points: PlayerPoint[] = visible
-      ? state.players().flatMap((p) => (p.location ? [{ id: p.userId, lat: p.location.lat, lng: p.location.lng }] : []))
+      ? state.players().flatMap((p) => {
+          const pos = this.posOf(p);
+          return pos ? [{ id: p.userId, lat: pos.lat, lng: pos.lng }] : [];
+        })
       : [];
     const pointsKey = JSON.stringify(points);
     if (pointsKey !== this.lastPlayers) {
       this.lastPlayers = pointsKey;
       this.toPage({ type: "players", players: points });
     }
+    this.syncGhosts();
     if (!visible && this.cardId) this.closeCard();
     this.syncForecast();
     if (this.followId) {
       const p = visible ? state.player(this.followId) : undefined;
-      if (!p?.location) return;
-      const k = `${p.userId}:${p.location.lat}:${p.location.lng}`;
+      const pos = p && this.posOf(p);
+      if (!p || !pos) return;
+      const k = `${p.userId}:${pos.lat}:${pos.lng}`;
       if (k !== this.lastFollowSent) {
         this.lastFollowSent = k;
-        this.toPage({ type: "follow", id: p.userId, lat: p.location.lat, lng: p.location.lng });
+        this.toPage({ type: "follow", id: p.userId, lat: pos.lat, lng: pos.lng });
       }
     }
   }
 
+  /**
+   * While bypassing a blackout the site stops drawing contestants, so we draw every alive
+   * player ourselves: live if their position is still updating, frozen at the last fix if not.
+   */
+  private syncGhosts() {
+    const state = this.client.state;
+    const ghosts: GhostMarker[] = [];
+    if (this.bypassing) {
+      const now = state.now();
+      for (const p of state.players()) {
+        const pos = this.posOf(p);
+        const dead = !!p.status && (!p.status.alive || p.status.status === "eliminated");
+        if (!pos || dead) continue;
+        const live = !!p.location && now - p.location.recordedAt <= state.staleAfterMs;
+        ghosts.push({
+          id: p.userId,
+          lat: pos.lat,
+          lng: pos.lng,
+          label: p.username,
+          avatar: p.avatarUrl,
+          live,
+          // Bucketed so the label (and the message) only changes once a minute.
+          age: live ? null : formatDuration(Math.floor((now - pos.recordedAt) / 60_000) * 60_000),
+          dead,
+        });
+      }
+    }
+    const key = JSON.stringify(ghosts);
+    if (key === this.lastGhosts) return;
+    this.lastGhosts = key;
+    this.toPage({ type: "ghosts", ghosts });
+  }
+
   private locate(p: Player) {
     if (this.mode !== "normal") return;
-    const pos = p.location ?? p.lastKnown;
+    const pos = this.posOf(p) ?? p.lastKnown;
     if (!pos) return;
     this.focusId = p.userId;
     this.followId = null;
@@ -592,9 +769,9 @@ export class App {
     this.renderCard();
   }
 
-  private onCardClick(e: MouseEvent) {
+  private onCardClick(e: MouseEvent, userId = this.cardId) {
     const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
-    const p = this.cardId ? this.client.state.player(this.cardId) : undefined;
+    const p = userId ? this.client.state.player(userId) : undefined;
     if (!act || !p) return;
     switch (act) {
       case "fav":
@@ -606,12 +783,93 @@ export class App {
       case "details":
         this.revealPlayer(p.userId, false);
         return;
+      case "locate":
+        this.locate(p);
+        return;
       case "close":
         this.closeCard();
     }
   }
 
+  /** Buttons shared by the floating action bar and the strip inside the site's card. */
+  private cardActionsHtml(p: Player, inline: boolean): string {
+    this.ensureKick(p);
+    const { entry, channel } = this.kickFor(p);
+    const fav = this.store.isFavourite(p.userId);
+    return (
+      (inline ? '<span class="cname">SafeZone<b>+</b></span>' : `<span class="cname">${esc(p.username)}</span>`) +
+      (channel?.live ? `<span class="live">● LIVE${channel.viewers != null ? ` ${channel.viewers.toLocaleString()}` : ""}</span>` : "") +
+      `<button class="icon-btn ${fav ? "on" : ""}" data-act="fav" title="${fav ? "Unfavourite" : "Favourite"}">${fav ? ICON.star : ICON.starOff}</button>` +
+      `<button class="pbtn primary" data-act="watch"${channel ? "" : " disabled"} title="${channel ? `Watch ${esc(channel.slug)} in a floating player` : entry?.pending ? "Checking Kick…" : "No Kick channel found"}">${ICON.tv} Watch</button>` +
+      (channel ? `<a class="pbtn" href="${kickChannelUrl(channel.slug)}" target="_blank" rel="noopener" title="Open on Kick">Kick ${ICON.external}</a>` : "") +
+      (inline ? `<button class="icon-btn" data-act="locate" title="Show on map">${ICON.pin}</button>` : "") +
+      `<button class="icon-btn" data-act="details" title="Details in SafeZone+">${ICON.panel}</button>` +
+      (inline ? "" : `<button class="icon-btn" data-act="close" title="Close (Esc)">${ICON.x}</button>`)
+    );
+  }
+
+  /**
+   * The site opens a contestant card (a dismissable modal) when a player is clicked. Our
+   * floating bar would overlap it, and clicking it would count as "outside" and close the
+   * card, so while it's open we hide the bar and put the same actions inside the card.
+   */
+  private syncSiteCard() {
+    const dialog = this.findSiteCard();
+    const cur = this.siteCard;
+    if (cur && (!dialog || cur.dialog !== dialog || !dialog.contains(cur.host))) {
+      cur.host.remove();
+      this.siteCard = null;
+      if (!dialog) {
+        // The user closed the site's card: they're done with this player.
+        if (this.cardId === cur.userId) this.closeCard();
+        return;
+      }
+    }
+    if (!dialog || this.siteCard) return;
+    const userId = this.cardUserId(dialog);
+    if (!userId) return;
+    const header = dialog.firstElementChild;
+    if (!header) return;
+    const host = document.createElement("div");
+    host.dataset.szpCard = "";
+    host.style.cssText = "display:block;padding:8px 16px 0;";
+    const root = host.attachShadow({ mode: "open" });
+    root.innerHTML = `<style>${CSS}</style><div class="card inline"></div>`;
+    root.querySelector(".card")!.addEventListener("click", (e) => this.onCardClick(e as MouseEvent, userId));
+    header.after(host);
+    this.siteCard = { dialog, userId, host, root, key: "" };
+    this.renderSiteCard();
+    this.positionCard();
+  }
+
+  /** The open contestant card: a dialog whose heading is a player's name. */
+  private findSiteCard(): HTMLElement | null {
+    for (const d of document.querySelectorAll<HTMLElement>('[role="dialog"]')) {
+      if (this.host.contains(d) || d.closest("#safezone-plus")) continue;
+      if (d === this.siteCard?.dialog || this.cardUserId(d)) return d;
+    }
+    return null;
+  }
+
+  private cardUserId(dialog: HTMLElement): string | null {
+    const name = dialog.querySelector("h2")?.textContent?.trim().toLowerCase();
+    if (!name) return null;
+    const p = this.client.state.players().find((x) => x.username.toLowerCase() === name || x.roster?.name.toLowerCase() === name);
+    return p?.userId ?? null;
+  }
+
+  private renderSiteCard() {
+    const sc = this.siteCard;
+    if (!sc) return;
+    const p = this.client.state.player(sc.userId);
+    const html = p ? this.cardActionsHtml(p, true) : "";
+    if (html === sc.key) return;
+    sc.key = html;
+    sc.root.querySelector(".card")!.innerHTML = html;
+  }
+
   private renderCard() {
+    this.renderSiteCard();
     const el = this.$.card;
     const p = this.cardId && this.mode === "normal" ? this.client.state.player(this.cardId) : undefined;
     if (!p) {
@@ -619,17 +877,7 @@ export class App {
       this.cardKey = "";
       return;
     }
-    this.ensureKick(p);
-    const { entry, channel } = this.kickFor(p);
-    const fav = this.store.isFavourite(p.userId);
-    const html =
-      `<span class="cname">${esc(p.username)}</span>` +
-      (channel?.live ? `<span class="live">● LIVE${channel.viewers != null ? ` ${channel.viewers.toLocaleString()}` : ""}</span>` : "") +
-      `<button class="icon-btn ${fav ? "on" : ""}" data-act="fav" title="${fav ? "Unfavourite" : "Favourite"}">${fav ? ICON.star : ICON.starOff}</button>` +
-      `<button class="pbtn primary" data-act="watch"${channel ? "" : " disabled"} title="${channel ? `Watch ${esc(channel.slug)} in a floating player` : entry?.pending ? "Checking Kick…" : "No Kick channel found"}">${ICON.tv} Watch</button>` +
-      (channel ? `<a class="pbtn" href="${kickChannelUrl(channel.slug)}" target="_blank" rel="noopener" title="Open on Kick">Kick ${ICON.external}</a>` : "") +
-      `<button class="icon-btn" data-act="details" title="Details in SafeZone+">${ICON.panel}</button>` +
-      `<button class="icon-btn" data-act="close" title="Close (Esc)">${ICON.x}</button>`;
+    const html = this.cardActionsHtml(p, false);
     if (html !== this.cardKey) {
       this.cardKey = html;
       el.innerHTML = html;
@@ -640,7 +888,8 @@ export class App {
   private positionCard() {
     const el = this.$.card;
     const pos = this.cardPos;
-    if (!this.cardId || !pos?.visible || this.mode !== "normal") {
+    const siteCardOpen = !!this.siteCard && this.siteCard.userId === this.cardId;
+    if (!this.cardId || !pos?.visible || this.mode !== "normal" || siteCardOpen) {
       el.hidden = true;
       return;
     }
@@ -721,6 +970,8 @@ export class App {
     const p = this.client.state.player(id);
     if (!p) return;
     const act = target.closest<HTMLElement>("[data-act]")?.dataset.act;
+    // Clicking or scrolling inside the expanded details shouldn't collapse the row.
+    if (!act && target.closest(".more")) return;
     switch (act) {
       case "fav":
         void this.store.toggleFavourite(p.userId, p.username);
@@ -750,6 +1001,9 @@ export class App {
     else if (el.name === "locateZoom") void this.store.updateSettings({ locateZoom: Number(el.value) });
     else if (el.name === "zoneForecast") void this.store.updateSettings({ zoneForecast: (el as HTMLInputElement).checked });
     else if (el.name === "forecastMinutes") void this.store.updateSettings({ forecastMinutes: Number(el.value) });
+    else if (el.name === "showDuringBlackout") void this.store.updateSettings({ showDuringBlackout: (el as HTMLInputElement).checked });
+    else if (el.name === "hideHeader") void this.store.updateSettings({ hideHeader: (el as HTMLInputElement).checked });
+    else if (el.name === "contestantInfo") void this.store.updateSettings({ contestantInfo: (el as HTMLInputElement).checked });
     else if (el.name.startsWith("kind:")) {
       const kind = el.name.slice(5) as keyof typeof s.alertKinds;
       void this.store.updateSettings({ alertKinds: { ...s.alertKinds, [kind]: (el as HTMLInputElement).checked } });
@@ -790,13 +1044,17 @@ export class App {
     }
     const players = state.players();
     const alive = players.filter((p) => p.status?.alive).length;
+    const zones = state.safeZones();
     const zone = state.safeZone();
     const z = zone ? zoneAt(zone, state.now()) : null;
-    const shrinking = zone?.transition && Date.parse(zone.transition.ends_at) > state.now();
+    const shrinking = zones.some((zz) => zz.transition && Date.parse(zz.transition.ends_at) > state.now());
     const moving = zoneMotionText(state.zoneMotion());
+    const zoneText = zones.length > 1
+      ? `<span title="${zones.map((zz) => formatDistance(zoneAt(zz, state.now()).radius)).join(" + ")} radius circles; safe inside any of them">${zones.length} zones</span>`
+      : z ? `zone ${formatDistance(z.radius)}` : "";
     this.$.hstats.innerHTML =
       `<span class="n">${alive}</span>/${players.length} alive` +
-      (z ? ` · zone ${formatDistance(z.radius)}${shrinking ? ' <span class="warn" title="Zone is shrinking">▼</span>' : ""}` : "") +
+      (zoneText ? ` · ${zoneText}${shrinking ? ' <span class="warn" title="Zone is shrinking">▼</span>' : ""}` : "") +
       (moving ? ` <span class="zmove" title="Zone drift (estimated from recent updates)">${moving.replace(/ [NSEW]+ /, " ")}</span>` : "") +
       (this.unread && this.ui.collapsed ? ` <span class="badge">${this.unread}</span>` : "");
   }
@@ -806,6 +1064,7 @@ export class App {
     const b = this.$.banner;
     let text = "";
     let bad = false;
+    let warn = false;
     switch (this.mode) {
       case "disabled":
         text = "The public map is currently disabled.";
@@ -815,17 +1074,26 @@ export class App {
         break;
       case "blackout": {
         const bo = state.blackout!;
-        text = `${bo.source === "emp" ? "An EMP" : "A smoke bomb"} has blacked out the map until ${timeOf(Date.parse(bo.until))}. Positions and health are hidden until then.`;
+        text = `${bo.source === "emp" ? "An EMP" : "A smoke bomb"} has blacked out the map until ${timeOf(Date.parse(bo.until))}. Positions and health are hidden until then (see Settings → Blackouts).`;
         bad = true;
         break;
       }
       default:
-        if (state.event?.upstream === "down") text = "The event feed is reporting upstream issues — data may be stale.";
+        if (this.bypassing) {
+          const bo = state.blackout!;
+          const now = state.now();
+          const players = state.players().filter((p) => p.status?.alive !== false);
+          const live = players.filter((p) => p.location && now - p.location.recordedAt <= state.staleAfterMs).length;
+          const frozen = players.filter((p) => this.posOf(p)).length - live;
+          text = `${bo.source === "emp" ? "EMP" : "Smoke"} blackout until ${timeOf(Date.parse(bo.until))}. Showing players anyway: ${live} still updating${frozen ? `, ${frozen} at their last known position (dashed)` : ""}.`;
+          warn = true;
+        } else if (state.event?.upstream === "down") text = "The event feed is reporting upstream issues — data may be stale.";
         else if (this.conn === "reconnecting") text = "Reconnecting to the live feed…";
     }
     b.hidden = !text;
     b.textContent = text;
     b.classList.toggle("bad", bad);
+    b.classList.toggle("warn", warn);
   }
 
   private renderTabs() {
@@ -838,23 +1106,23 @@ export class App {
 
   private views(): { all: RowView[]; byId: Map<string, RowView> } {
     const state = this.client.state;
-    const zone = state.safeZone();
-    const circle = zone ? zoneAt(zone, state.now()) : null;
+    const zones = state.movingZones();
+    const circles = zones.map(({ zone }) => zoneAt(zone, state.now()));
     const zombies = state.zombies();
     const chasing = new Map<string, Zombie[]>();
     for (const z of zombies) if (z.targetUserId) chasing.set(z.targetUserId, [...(chasing.get(z.targetUserId) ?? []), z]);
     const now = state.now();
-    const motion = state.zoneMotion();
     const all = state.players().map((p) => {
       const dead = !!p.status && (!p.status.alive || p.status.status === "eliminated");
+      const pos = this.posOf(p);
       return {
         p,
         fav: p.userId in this.store.favourites,
         dead,
-        margin: p.location && circle ? edgeMarginM(p.location, circle) : null,
+        margin: pos ? unionMarginM(pos, circles) : null,
         stale: state.isStale(p, now),
         chasers: chasing.get(p.userId) ?? [],
-        eta: !dead && p.location && zone ? edgeEta(p.location, zone, motion, now) : null,
+        eta: !dead && pos ? edgeEtaAny(pos, zones, now) : null,
       };
     });
     return { all, byId: new Map(all.map((v) => [v.p.userId, v])) };
@@ -955,23 +1223,36 @@ export class App {
       body.className = "body";
       const actions = document.createElement("div");
       actions.className = "actions";
-      el.append(av, body, actions);
+      // Details span the whole row (under the avatar and the action buttons too).
+      const more = document.createElement("div");
+      more.className = "more";
+      el.append(av, body, actions, more);
       cached = { el, key: "" };
       this.rows.set(p.userId, cached);
     }
-    const { body, actions } = this.rowHtml(v);
+    const { body, actions, details } = this.rowHtml(v);
     const key = body + actions;
     if (key !== cached.key) {
       cached.key = key;
       (cached.el.children[1] as HTMLElement).innerHTML = body;
       (cached.el.children[2] as HTMLElement).innerHTML = actions;
     }
+    const more = cached.el.children[3] as HTMLElement;
+    if (more.dataset.html !== details) {
+      // Keep the activity list's scroll position across updates.
+      const scroll = more.querySelector(".act")?.scrollTop ?? 0;
+      more.dataset.html = details;
+      more.innerHTML = details;
+      more.hidden = !details;
+      const act = more.querySelector(".act");
+      if (act) act.scrollTop = scroll;
+    }
     cached.el.classList.toggle("dead", v.dead);
     cached.el.classList.toggle("focus", p.userId === this.focusId || p.userId === this.followId);
     return cached.el;
   }
 
-  private rowHtml(v: RowView): { body: string; actions: string } {
+  private rowHtml(v: RowView): { body: string; actions: string; details: string } {
     const { p } = v;
     const state = this.client.state;
     const now = state.now();
@@ -995,6 +1276,7 @@ export class App {
       }
       if (v.margin !== null) parts.push(v.margin >= 0 ? `<span class="ok">${formatDistance(v.margin)} in</span>` : `<span class="bad">${formatDistance(v.margin)} out</span>`);
       if (p.location) parts.push(`<span class="${v.stale ? "warn" : "dim"}">${formatDuration(now - p.location.recordedAt)}</span>`);
+      else if (this.bypassing && p.lastSeen) parts.push(`<span class="warn" title="Last known position">frozen ${formatDuration(now - p.lastSeen.recordedAt)}</span>`);
       else if (p.lastKnown) parts.push('<span class="warn">hidden</span>');
       else parts.push('<span class="dim">no location</span>');
       l2 = parts.join("<span class=dim>·</span>");
@@ -1029,19 +1311,18 @@ export class App {
     const body =
       `<div class="l1"><span class="name">${esc(p.username)}</span>${kick}</div>` +
       `<div class="l2">${l2}</div>` +
-      (tags.length ? `<div class="tags">${tags.join("")}</div>` : "") +
-      details;
+      (tags.length ? `<div class="tags">${tags.join("")}</div>` : "");
 
-    const canMap = !hidden && !!(p.location ?? p.lastKnown);
+    const canMap = !hidden && !!(this.posOf(p) ?? p.lastKnown);
     const following = this.followId === p.userId;
     const btn = (act: string, icon: string, title: string, enabled = true, cls = "") =>
       `<button class="icon-btn ${cls}" data-act="${act}" title="${esc(title)}"${enabled ? "" : " disabled"}>${icon}</button>`;
     const actions =
       btn("fav", v.fav ? ICON.star : ICON.starOff, v.fav ? "Unfavourite" : "Favourite", true, v.fav ? "on" : "") +
       btn("locate", ICON.pin, canMap ? "Show on map" : "No position available", canMap) +
-      btn("follow", ICON.follow, following ? "Stop following" : "Follow on map", canMap && !!p.location, following ? "on-accent" : "") +
+      btn("follow", ICON.follow, following ? "Stop following" : "Follow on map", canMap && !!this.posOf(p), following ? "on-accent" : "") +
       btn("watch", ICON.tv, channel ? `Watch ${channel.slug}` : entry?.pending ? "Checking Kick…" : "No Kick channel found", !!channel);
-    return { body, actions };
+    return { body, actions, details };
   }
 
   /** "12m ago · zone" / "3m ago · killed by X" for eliminated players. */
@@ -1057,22 +1338,27 @@ export class App {
     const { p } = v;
     const state = this.client.state;
     const rows: string[] = [];
-    if (this.mode === "normal" && p.location) {
-      const loc = p.location;
-      rows.push(`<div><span class="k">Position</span> ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)} ±${loc.accuracyM}m</div>`);
-      const zone = state.safeZone();
-      if (zone) {
-        const c = zoneAt(zone, state.now());
+    const loc = this.mode === "normal" ? this.posOf(p) : null;
+    if (loc) {
+      const frozen = !p.location;
+      rows.push(`<div><span class="k">${frozen ? "Last known" : "Position"}</span> ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)} ±${loc.accuracyM}m${frozen ? ` <span class="warn">(${formatDuration(state.now() - loc.recordedAt)} ago)</span>` : ""}</div>`);
+      const zones = state.safeZones();
+      const now = state.now();
+      const nearest = nearestCircle(loc, zones.map((zone) => ({ ...zoneAt(zone, now), zone })));
+      if (nearest) {
         const moving = zoneMotionText(state.zoneMotion());
-        rows.push(`<div><span class="k">Zone centre</span> ${formatDistance(distanceM(loc, c))} ${compass(bearingDeg(loc, c))}${moving ? ` · zone moving <span class="zmove">${moving}</span>` : ""}</div>`);
+        const label = zones.length > 1 ? "Nearest zone centre" : "Zone centre";
+        rows.push(`<div><span class="k">${label}</span> ${formatDistance(distanceM(loc, nearest))} ${compass(bearingDeg(loc, nearest))}${moving ? ` · zone moving <span class="zmove">${moving}</span>` : ""}</div>`);
         if (v.eta) {
           rows.push(v.eta.kind === "exits"
             ? `<div><span class="k">If they stay put</span> <span class="${v.eta.ms < 5 * 60_000 ? "bad" : "warn"}">outside in ${formatDuration(v.eta.ms)}</span> (~${timeOf(state.now() + v.eta.ms)})</div>`
             : `<div><span class="k">If they stay put</span> zone reaches them in ${formatDuration(v.eta.ms)} (~${timeOf(state.now() + v.eta.ms)})</div>`);
         }
-        if (zone.transition && Date.parse(zone.transition.ends_at) > state.now()) {
-          const m = edgeMarginM(loc, zoneTarget(zone));
-          rows.push(`<div><span class="k">After shrink</span> <span class="${m >= 0 ? "ok" : "bad"}">${formatDistance(m)} ${m >= 0 ? "inside" : "outside"}</span> by ${timeOf(Date.parse(zone.transition.ends_at))}</div>`);
+        const shrinks = zones.filter((zz) => zz.transition && Date.parse(zz.transition.ends_at) > now);
+        if (shrinks.length) {
+          const m = unionMarginM(loc, zones.map(zoneTarget))!;
+          const by = Math.max(...shrinks.map((zz) => Date.parse(zz.transition!.ends_at)));
+          rows.push(`<div><span class="k">After shrink</span> <span class="${m >= 0 ? "ok" : "bad"}">${formatDistance(m)} ${m >= 0 ? "inside" : "outside"}</span> by ${timeOf(by)}</div>`);
         }
       }
       const near = describeNearby(state, p);
@@ -1080,6 +1366,7 @@ export class App {
     } else if (this.mode === "normal" && p.lastKnown) {
       rows.push(`<div><span class="k">Last known</span> ${p.lastKnown.lat.toFixed(5)}, ${p.lastKnown.lng.toFixed(5)} (${formatDuration(state.now() - p.lastKnown.recordedAt)} ago)</div>`);
     }
+    if (this.store.settings.contestantInfo) rows.push(...this.contestantInfoHtml(p));
     if (v.dead && p.death) {
       const d = p.death;
       rows.push(`<div><span class="k">Died</span> ${timeOf(d.at)} (${esc(this.deathText(p)!)})${d.cause ? ` · ${esc(d.cause)}` : ""}</div>`);
@@ -1096,11 +1383,77 @@ export class App {
       btns.push(`<button class="pbtn primary" data-act="watch">${ICON.tv} Watch</button>`);
       btns.push(`<a class="pbtn" href="${kickChannelUrl(channel.slug)}" target="_blank" rel="noopener">Open on Kick ${ICON.external}</a>`);
     }
-    if (this.mode === "normal" && p.location) {
-      btns.push(`<a class="pbtn" href="https://www.google.com/maps?q=${p.location.lat},${p.location.lng}" target="_blank" rel="noopener">Google Maps ${ICON.external}</a>`);
+    if (loc) {
+      btns.push(`<a class="pbtn" href="https://www.google.com/maps?q=${loc.lat},${loc.lng}" target="_blank" rel="noopener">Google Maps ${ICON.external}</a>`);
     }
     if (btns.length) rows.push(`<div class="btns">${btns.join("")}</div>`);
     return `<div class="details">${rows.join("")}</div>`;
+  }
+
+  /**
+   * What the site's contestant card shows: sigil and inventory (from the roster, only while the
+   * event makes stats visible) and the activity log (fetched on demand, like the card does).
+   */
+  private contestantInfoHtml(p: Player): string[] {
+    const state = this.client.state;
+    const rows: string[] = [];
+    const roster = p.roster;
+    if (!roster) return rows;
+    if (state.rosterStatsVisible && roster.sigil) {
+      const name = roster.sigil.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      rows.push(`<div><span class="k">Sigil</span> ${esc(name)}</div>`);
+    }
+    const inv = state.rosterStatsVisible ? (roster.inventory ?? []) : [];
+    if (inv.length) {
+      const items = inv.map((it) =>
+        `<span title="${esc(it.label)}${it.stealable ? "" : " (can't be stolen)"}">${it.icon ? `<img src="${esc(it.icon.url)}" alt="">` : ""}${esc(it.label)}${it.icon?.badge ? ` <b>${esc(it.icon.badge)}</b>` : ""}</span>`);
+      rows.push(`<div><span class="k">Inventory</span></div><div class="inv">${items.join("")}</div>`);
+    }
+    const act = this.ensureActivity(roster.id);
+    let body: string;
+    if (act.log && !act.log.visible) body = '<span class="dim">Activity is hidden right now.</span>';
+    else if (act.log?.entries.length) {
+      const now = state.now();
+      body = `<div class="act">${act.log.entries.slice(0, 12).map((e) => {
+        const at = Date.parse(e.at);
+        const hp = e.hp_before !== null && e.hp_after !== null ? ` <span class="dim">${e.hp_before}→${e.hp_after} HP</span>` : "";
+        const icon = e.icon ? `<img src="${esc(e.icon.url)}" alt="">` : '<i class="noicon"></i>';
+        return `<div class="${esc(e.category)}">${icon}<span>${esc(e.text)}${hp}</span><span class="when" title="${timeOf(at)}">${ago(now - at)}</span></div>`;
+      }).join("")}</div>`;
+    } else if (act.log) body = '<span class="dim">No activity yet.</span>';
+    else if (act.error === "blocked" || act.error === "rate limited") body = '<span class="dim">The site is refusing activity requests right now (busy or rate limiting). SafeZone+ retries in a couple of minutes.</span>';
+    else if (act.error) body = `<span class="dim">Couldn't load activity (${esc(act.error)}). Retrying in a couple of minutes.</span>`;
+    else body = '<span class="dim">Loading…</span>';
+    rows.push(`<div><span class="k">Activity</span></div>${body}`);
+    return rows;
+  }
+
+  /** Cached activity log for a contestant, refreshed every 15s while someone is looking at it. */
+  private ensureActivity(contestantId: string): ActivityEntryState {
+    let a = this.activity.get(contestantId);
+    if (!a) this.activity.set(contestantId, (a = { at: 0, log: null, error: null, pending: false }));
+    const ttl = a.error ? ACTIVITY_RETRY_MS : ACTIVITY_TTL_MS;
+    if (a.pending || Date.now() - a.at < ttl || document.visibilityState === "hidden") return a;
+    a.pending = true;
+    const entry = a;
+    fetch(ACTIVITY_URL(contestantId), { credentials: "omit" })
+      .then(async (res) => {
+        if (!res.ok) {
+          const text = (await res.text().catch(() => "")).slice(0, 200);
+          throw new Error(/blocked/i.test(text) || res.status === 403 ? "blocked" : res.status === 429 ? "rate limited" : `HTTP ${res.status}`);
+        }
+        entry.log = (await res.json()) as ActivityLog;
+        entry.error = null;
+      })
+      .catch((err: unknown) => {
+        entry.error = err instanceof Error ? err.message : "network error";
+      })
+      .finally(() => {
+        entry.at = Date.now();
+        entry.pending = false;
+        this.scheduleRender();
+      });
+    return a;
   }
 
   private renderAlerts() {
@@ -1142,11 +1495,31 @@ export class App {
         <div class="hint">Speed and direction are estimated from the zone's recent movement (needs ~15s after loading).</div>
       </div>
       <div>
+        <h4>Blackouts</h4>
+        <label><input type="checkbox" name="showDuringBlackout"${s.showDuringBlackout ? " checked" : ""}> Keep showing players during EMP / smoke blackouts</label>
+        <div class="hint">The EMP is meant to blind contestants, not viewers. Players whose position stops updating stay at their last known spot (dashed outline).</div>
+      </div>
+      <div>
+        <h4>Players</h4>
+        <label><input type="checkbox" name="contestantInfo"${s.contestantInfo ? " checked" : ""}> Show inventory, sigil and activity in player details</label>
+      </div>
+      <div>
+        <h4>Site</h4>
+        <label><input type="checkbox" name="hideHeader"${s.hideHeader ? " checked" : ""}> Hide the site's header to give the map more room</label>
+        <div class="hint">Move the pointer to the top edge of the window, or click the small tab at the top, to bring the tabs and your account menu back.</div>
+      </div>
+      <div>
         <h4>Favourites</h4>
         <div class="hint">${Object.keys(this.store.favourites).length} favourites · synced with your browser profile.</div>
         <p><button class="btn" data-ui="clear-favs">Clear all favourites</button></p>
       </div>
       <div class="hint">Press <b>/</b> anywhere on the map to search. Enter jumps to the top result.</div>
+      <div class="about">
+        <span>SafeZone+ v${esc(chrome.runtime.getManifest?.().version ?? "?")}${this.update?.available && this.update.latest ? ` · <b class="ok">v${esc(this.update.latest.version)} available</b>` : this.update?.latest ? " · up to date" : ""}</span>
+        ${this.update?.available && this.update.latest ? `<a class="pbtn primary" href="${esc(this.update.latest.download ?? RELEASES_URL)}" target="_blank" rel="noopener">Download ${ICON.external}</a>` : ""}
+        <button class="btn" data-ui="check-update">Check for updates</button>
+      </div>
+      ${this.update?.error ? `<div class="hint">Last update check failed (${esc(this.update.error)}).</div>` : ""}
       <div class="hint">Map markers: ${this.mapNative ? "attached to the site's own player sprites ✓" : this.mapFound ? "fallback overlay (site renderer not found)" : "waiting for the map…"}</div>`;
   }
 }

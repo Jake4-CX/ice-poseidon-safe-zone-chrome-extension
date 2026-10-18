@@ -10,6 +10,7 @@ import {
 } from "./binary.js";
 import {
   applyPatch,
+  type ClaimableObject,
   parseTextMessage,
   type EventMessage,
   type Explosion,
@@ -67,6 +68,11 @@ export interface Player {
    * blackout) or the client resyncs. Equals `location` while that is present.
    */
   lastSeen: PlayerLocation | null;
+  /**
+   * The server is withholding player data (it sends an empty slot list during an EMP/smoke
+   * blackout). The player comes from what we knew before; `status` is their last known one.
+   */
+  withheld: boolean;
   /** Curated roster entry (kick slug, live flag) when the server provides one. */
   roster: RosterContestant | null;
   location: PlayerLocation | null;
@@ -124,6 +130,11 @@ export class SafeZoneState {
   /** One drift estimator per safe zone id (the server can run several zones at once). */
   private zoneTrackers = new Map<string, ZoneTracker>();
   private lastSeen = new Map<string, PlayerLocation>();
+  /** Every slot ever received, so players survive the server emptying the list (blackouts). */
+  private rememberedSlots = new Map<string, Slot>();
+  private lastChests: { at: number; chests: ClaimableObject[] } | null = null;
+  /** Last status per player, kept through clears like `lastSeen`. */
+  private lastStatus = new Map<string, PlayerStatus>();
   /** Deaths are kept even after the gravestone disappears (looted/expired). */
   private deaths = new Map<string, PlayerDeath>();
   private latestSampledAt = 0;
@@ -208,6 +219,7 @@ export class SafeZoneState {
         if (slots) {
           this.slotsDefinition = slots.definition_sequence;
           this.slots = new Map(slots.slots.map((s) => [s.slot, s]));
+          for (const s of slots.slots) this.rememberedSlots.set(s.user_id, s);
           const ids = new Set(slots.slots.map((s) => s.user_id));
           for (const m of [this.locations, this.watermarks, this.statuses]) {
             for (const id of m.keys()) if (!ids.has(id)) m.delete(id);
@@ -219,11 +231,13 @@ export class SafeZoneState {
       case "map_objects":
         this.mapObjects = msg.data;
         this.observeZone();
+        this.rememberChests();
         this.mark("map_objects");
         return;
       case "map_objects_patch":
         this.mapObjects = applyPatch(this.mapObjects, msg.data);
         this.observeZone();
+        this.rememberChests();
         this.mark("map_objects");
         return;
       case "game_items":
@@ -254,6 +268,16 @@ export class SafeZoneState {
   streamTime(): number {
     const now = this.now();
     return this.latestSampledAt && Math.abs(now - this.latestSampledAt) > 60_000 ? this.latestSampledAt : now;
+  }
+
+  /**
+   * Unclaimed chests as last seen. The server removes every chest from map_objects during an
+   * EMP/smoke blackout, so this is the only way to still show where they were.
+   */
+  private rememberChests() {
+    const chests = this.mapObjects.filter((o): o is ClaimableObject => o.type === "claimable");
+    if (!chests.length) return; // withheld (or genuinely none left): keep the last known set
+    this.lastChests = { at: this.streamTime(), chests: chests.filter((c) => !c.claimed) };
   }
 
   private observeZone() {
@@ -333,6 +357,7 @@ export class SafeZoneState {
             this.deaths.set(s.user_id, { at: f.header.sampledAt, cause: null, source: null, killer: null });
           }
           this.statuses.set(s.user_id, status);
+          this.lastStatus.set(s.user_id, status);
         }
         if (f.header.mode !== "sparse") {
           for (const id of this.statuses.keys()) if (!seen.has(id)) this.statuses.delete(id);
@@ -400,6 +425,36 @@ export class SafeZoneState {
     }
   }
 
+  /** Chests currently on the map. */
+  chests(): ClaimableObject[] {
+    return this.mapObjects.filter((o): o is ClaimableObject => o.type === "claimable");
+  }
+
+  /** Unclaimed chests from before the server stopped sending them (see rememberChests). */
+  rememberedChests(): { at: number; chests: ClaimableObject[] } | null {
+    return this.lastChests;
+  }
+
+  /** Restore remembered chests (e.g. after a reload during a blackout); newer data wins. */
+  seedChests(saved: { at: number; chests: ClaimableObject[] }): void {
+    if (this.lastChests && this.lastChests.at >= saved.at) return;
+    this.lastChests = saved;
+    this.mark("map_objects");
+    this.flush();
+  }
+
+  /** Last status (HP, alive, badges) per player, for persisting alongside {@link exportLastSeen}. */
+  exportLastStatus(): Record<string, PlayerStatus> {
+    return Object.fromEntries(this.lastStatus);
+  }
+
+  /** Restore remembered statuses; ones received in this session win. */
+  seedLastStatus(entries: Record<string, PlayerStatus>): void {
+    for (const [id, st] of Object.entries(entries)) if (!this.lastStatus.has(id)) this.lastStatus.set(id, st);
+    this.mark("status");
+    this.flush();
+  }
+
   /** Every safe zone. The safe area is their union: a player is safe inside any of them. */
   safeZones(): SafeZoneObject[] {
     return this.mapObjects.filter((o): o is SafeZoneObject => o.type === "safe_zone");
@@ -424,10 +479,31 @@ export class SafeZoneState {
     return zone ? (this.zoneTrackers.get(zone.id)?.motion() ?? null) : null;
   }
 
+  /**
+   * True while the server sends an empty slot list even though the event has contestants: it
+   * does this for the length of an EMP/smoke blackout, together with empty location/status frames.
+   */
+  get playersWithheld(): boolean {
+    return this.slots.size === 0 && (this.rememberedSlots.size > 0 || this.roster.some((r) => r.map_user_id));
+  }
+
+  /** Players as we last knew them: remembered slots, plus roster entries we never had a slot for. */
+  private knownSlots(): Slot[] {
+    const out = [...this.rememberedSlots.values()];
+    const have = new Set(this.rememberedSlots.keys());
+    for (const r of this.roster) {
+      if (!r.map_user_id || have.has(r.map_user_id)) continue;
+      out.push({ slot: -1, user_id: r.map_user_id, username: r.name, avatar_url: r.avatar_url });
+    }
+    return out;
+  }
+
   players(): Player[] {
     const rosterByUser = new Map(this.roster.filter((r) => r.map_user_id).map((r) => [r.map_user_id!, r]));
     const lastKnownByUser = new Map(this.lastKnown.map((l) => [l.user_id, l]));
-    return [...this.slots.values()].map((s) => {
+    const withheld = this.playersWithheld;
+    const slots = withheld ? this.knownSlots() : [...this.slots.values()];
+    return slots.map((s) => {
       const lk = lastKnownByUser.get(s.user_id);
       return {
         userId: s.user_id,
@@ -439,7 +515,8 @@ export class SafeZoneState {
         location: this.locations.get(s.user_id) ?? null,
         lastSeen: this.lastSeen.get(s.user_id) ?? null,
         lastKnown: lk ? { lat: lk.lat, lng: lk.lng, recordedAt: Date.parse(lk.recorded_at) } : null,
-        status: this.statuses.get(s.user_id) ?? null,
+        status: (withheld ? this.lastStatus.get(s.user_id) : this.statuses.get(s.user_id)) ?? null,
+        withheld,
         death: this.deaths.get(s.user_id) ?? null,
       };
     });

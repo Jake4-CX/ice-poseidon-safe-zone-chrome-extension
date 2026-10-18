@@ -27,6 +27,7 @@ import {
   ALERT_KIND_LABELS,
   TO_CONTENT,
   TO_PAGE,
+  type ChestMarker,
   type GhostMarker,
   type KickResponse,
   type UpdateStatus,
@@ -41,7 +42,7 @@ import { buildForecast, zoneMotionText } from "./forecast.js";
 import { MapToasts } from "./map-toasts.js";
 import { SiteHeader } from "./site-header.js";
 import { RELEASES_URL } from "../update.js";
-import type { PlayerLocation } from "../../../src/core/index.js";
+import type { ClaimableObject, PlayerLocation, PlayerStatus } from "../../../src/core/index.js";
 import { Store, loadUi, saveUi, type UiState } from "./store.js";
 import { StreamWindow } from "./stream-window.js";
 import { CSS } from "./styles.js";
@@ -78,6 +79,12 @@ const ICON = {
 
 /** "now", "4m", "2h 5m": coarse enough not to change every second. */
 const ago = (ms: number) => (ms < 60_000 ? "now" : formatDuration(Math.floor(ms / 60_000) * 60_000).replace(/ 0s$/, ""));
+/**
+ * Eliminated per the live status, or (when no status is known, e.g. a page loaded during a
+ * blackout) per the roster's eliminated_at.
+ */
+const isDead = (p: Player) =>
+  p.status ? !p.status.alive || p.status.status === "eliminated" : !!p.roster?.eliminated_at;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const timeOf = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
@@ -158,6 +165,7 @@ export class App {
   private lastMarkers = "";
   private lastPlayers = "";
   private lastGhosts = "";
+  private lastChests = "";
   private siteHeader!: SiteHeader;
   private update: UpdateStatus | null = null;
   private lastSeenSaved = "";
@@ -241,6 +249,7 @@ export class App {
     this.toPage({ type: "markers", markers: [] });
     this.toPage({ type: "players", players: [] });
     this.toPage({ type: "ghosts", ghosts: [] });
+    this.toPage({ type: "chests", chests: [] });
     this.siteCard?.host.remove();
     this.toPage({ type: "anchors", ids: [] });
     this.toPage({ type: "zoneForecast", forecast: null });
@@ -499,10 +508,16 @@ export class App {
    */
   private async restoreLastSeen() {
     try {
-      const { lastSeen } = (await chrome.storage.local.get("lastSeen")) as { lastSeen?: Record<string, PlayerLocation> };
-      if (!lastSeen) return;
+      const { lastSeen, lastStatus, lastSeenAt, lastChests } = (await chrome.storage.local.get(["lastSeen", "lastStatus", "lastSeenAt", "lastChests"])) as {
+        lastSeen?: Record<string, PlayerLocation>;
+        lastStatus?: Record<string, PlayerStatus>;
+        lastSeenAt?: number;
+        lastChests?: { at: number; chests: ClaimableObject[] };
+      };
       const cutoff = Date.now() - LAST_SEEN_MAX_AGE_MS;
-      this.client.state.seedLastSeen(Object.fromEntries(Object.entries(lastSeen).filter(([, l]) => l.recordedAt > cutoff)));
+      if (lastSeen) this.client.state.seedLastSeen(Object.fromEntries(Object.entries(lastSeen).filter(([, l]) => l.recordedAt > cutoff)));
+      if (lastStatus && (lastSeenAt ?? 0) > cutoff) this.client.state.seedLastStatus(lastStatus);
+      if (lastChests && lastChests.at > cutoff) this.client.state.seedChests(lastChests);
     } catch {
       /* storage unavailable: nothing to restore */
     }
@@ -511,11 +526,15 @@ export class App {
   private saveLastSeen() {
     if (Date.now() - this.lastSeenSavedAt < LAST_SEEN_SAVE_MS) return;
     this.lastSeenSavedAt = Date.now();
-    const all = this.client.state.exportLastSeen();
-    const key = Object.values(all).reduce((m, l) => Math.max(m, l.recordedAt), 0) + ":" + Object.keys(all).length;
+    const state = this.client.state;
+    // Nothing new arrives while the server withholds players; don't overwrite the good copy.
+    if (state.playersWithheld) return;
+    const all = state.exportLastSeen();
+    const statuses = state.exportLastStatus();
+    const key = JSON.stringify(statuses).length + ":" + (state.rememberedChests()?.at ?? 0) + ":" + Object.values(all).reduce((m, l) => Math.max(m, l.recordedAt), 0) + ":" + Object.keys(all).length;
     if (key === this.lastSeenSaved || !Object.keys(all).length) return;
     this.lastSeenSaved = key;
-    void chrome.storage.local.set({ lastSeen: all });
+    void chrome.storage.local.set({ lastSeen: all, lastStatus: statuses, lastSeenAt: Date.now(), lastChests: state.rememberedChests() });
   }
 
   // ------------------------------------------------------------------ updates
@@ -544,7 +563,7 @@ export class App {
 
   private onState(changes: Set<StateChange>) {
     const relevant = ["status", "locations", "zombies", "projectiles", "slots"] as const;
-    if (this.mode === "normal" && relevant.some((c) => changes.has(c))) this.checkAlerts();
+    if (this.mode === "normal" && !this.client.state.playersWithheld && relevant.some((c) => changes.has(c))) this.checkAlerts();
     this.syncMap();
     this.scheduleRender();
   }
@@ -556,7 +575,7 @@ export class App {
       this.renderSettings();
       if (msg.found) {
         // The bridge may have (re)loaded: resend everything it needs.
-        this.lastMarkers = this.lastPlayers = this.lastForecast = this.lastAnchors = this.lastGhosts = "";
+        this.lastMarkers = this.lastPlayers = this.lastForecast = this.lastAnchors = this.lastGhosts = this.lastChests = "";
       }
       this.syncMap();
       this.scheduleRender();
@@ -656,7 +675,7 @@ export class App {
           lng: pos.lng,
           label: p.username,
           style: fav && focus ? "fav-focus" : focus ? "focus" : "fav",
-          dead: !!p.status && !p.status.alive,
+          dead: isDead(p),
         });
       }
     }
@@ -702,7 +721,7 @@ export class App {
       const now = state.now();
       for (const p of state.players()) {
         const pos = this.posOf(p);
-        const dead = !!p.status && (!p.status.alive || p.status.status === "eliminated");
+        const dead = isDead(p);
         if (!pos || dead) continue;
         const live = !!p.location && now - p.location.recordedAt <= state.staleAfterMs;
         ghosts.push({
@@ -712,16 +731,32 @@ export class App {
           label: p.username,
           avatar: p.avatarUrl,
           live,
-          // Bucketed so the label (and the message) only changes once a minute.
-          age: live ? null : formatDuration(Math.floor((now - pos.recordedAt) / 60_000) * 60_000),
+          // On this browser's clock; the bridge ticks the "3m 12s ago" label itself.
+          seenAt: live ? null : pos.recordedAt - state.clockOffsetMs,
           dead,
         });
       }
     }
     const key = JSON.stringify(ghosts);
-    if (key === this.lastGhosts) return;
-    this.lastGhosts = key;
-    this.toPage({ type: "ghosts", ghosts });
+    if (key !== this.lastGhosts) {
+      this.lastGhosts = key;
+      this.toPage({ type: "ghosts", ghosts });
+    }
+    this.syncChests();
+  }
+
+  /**
+   * The server removes every chest during a blackout. While bypassing it, draw the unclaimed
+   * chests we saw before (some may have been claimed since: they're shown dashed).
+   */
+  private syncChests() {
+    const state = this.client.state;
+    const saved = this.bypassing && !state.chests().length ? state.rememberedChests() : null;
+    const chests: ChestMarker[] = (saved?.chests ?? []).map((c) => ({ id: c.id, lat: c.lat, lng: c.lng, icon: c.url, rarity: c.rarity ?? null }));
+    const key = JSON.stringify(chests);
+    if (key === this.lastChests) return;
+    this.lastChests = key;
+    this.toPage({ type: "chests", chests });
   }
 
   private locate(p: Player) {
@@ -1038,11 +1073,11 @@ export class App {
     const state = this.client.state;
     this.$.conn.className = `conn ${this.conn}`;
     this.$.conn.title = `Feed: ${this.conn}${this.mapFound ? "" : " · map not detected yet"}`;
-    if (this.mode !== "normal" || !state.slots.size) {
-      this.$.hstats.textContent = state.slots.size ? "" : "loading…";
+    const players = state.players();
+    if (this.mode !== "normal" || !players.length) {
+      this.$.hstats.textContent = players.length ? "" : "loading…";
       return;
     }
-    const players = state.players();
     const alive = players.filter((p) => p.status?.alive).length;
     const zones = state.safeZones();
     const zone = state.safeZone();
@@ -1082,10 +1117,13 @@ export class App {
         if (this.bypassing) {
           const bo = state.blackout!;
           const now = state.now();
-          const players = state.players().filter((p) => p.status?.alive !== false);
+          const players = state.players().filter((p) => !isDead(p));
           const live = players.filter((p) => p.location && now - p.location.recordedAt <= state.staleAfterMs).length;
           const frozen = players.filter((p) => this.posOf(p)).length - live;
-          text = `${bo.source === "emp" ? "EMP" : "Smoke"} blackout until ${timeOf(Date.parse(bo.until))}. Showing players anyway: ${live} still updating${frozen ? `, ${frozen} at their last known position (dashed)` : ""}.`;
+          const what = `${bo.source === "emp" ? "EMP" : "Smoke"} blackout until ${timeOf(Date.parse(bo.until))}.`;
+          text = state.playersWithheld
+            ? `${what} The server sends no player data until then, so players are shown as they were last seen (⏸ dashed markers, last known HP)${frozen ? `: ${frozen} positions${state.rememberedChests()?.chests.length ? ` and ${state.rememberedChests()!.chests.length} chests` : ""} remembered` : ". No positions were remembered (SafeZone+ wasn't open before the blackout)"}.`
+            : `${what} Showing players anyway: ${live} still updating${frozen ? `, ${frozen} at their last known position (⏸ dashed)` : ""}.`;
           warn = true;
         } else if (state.event?.upstream === "down") text = "The event feed is reporting upstream issues — data may be stale.";
         else if (this.conn === "reconnecting") text = "Reconnecting to the live feed…";
@@ -1113,7 +1151,7 @@ export class App {
     for (const z of zombies) if (z.targetUserId) chasing.set(z.targetUserId, [...(chasing.get(z.targetUserId) ?? []), z]);
     const now = state.now();
     const all = state.players().map((p) => {
-      const dead = !!p.status && (!p.status.alive || p.status.status === "eliminated");
+      const dead = isDead(p);
       const pos = this.posOf(p);
       return {
         p,
@@ -1171,7 +1209,7 @@ export class App {
     let shown: RowView[] = [];
     if (restricted) {
       empty(this.mode === "anonymous" ? "Player list hidden while contestants are anonymous." : "The public map is disabled.");
-    } else if (!state.slots.size) {
+    } else if (!all.length) {
       empty("Connecting to the live feed…");
     } else if (this.query.trim()) {
       shown = state.search(this.query, 40).map((p) => byId.get(p.userId)!);

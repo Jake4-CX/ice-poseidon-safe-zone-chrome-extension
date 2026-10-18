@@ -3,7 +3,7 @@ node_modules/
 
 # Build output (attach the packaged zip to a GitHub release instead)
 extension/dist/
-release/
+/release/
 *.zip
 
 # Secrets and local config

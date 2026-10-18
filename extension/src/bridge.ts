@@ -12,7 +12,8 @@
  * click hit-testing also fall back to GPS for any player the site isn't drawing.
  */
 import { discoverMap, findRenderers, spriteGeom, type CxRenderer, type MlMap, type MlMapEvent, type SpriteGeom } from "./map-discovery.js";
-import { TO_CONTENT, TO_PAGE, type GhostMarker, type MapMarker, type PlayerPoint, type ToContent, type ToPage, type ZoneForecast } from "./shared.js";
+import { formatDuration } from "../../src/core/geo.js";
+import { TO_CONTENT, TO_PAGE, type ChestMarker, type GhostMarker, type MapMarker, type PlayerPoint, type ToContent, type ToPage, type ZoneForecast } from "./shared.js";
 
 let map: MlMap | null = null;
 let renderers: CxRenderer[] = [];
@@ -23,6 +24,7 @@ let following: string | null = null;
 let pending: ToPage | null = null;
 let forecast: ZoneForecast | null = null;
 let ghosts: GhostMarker[] = [];
+let chests: ChestMarker[] = [];
 const ghostMode = () => ghosts.length > 0;
 const anchorIds = new Set<string>();
 const lastAnchor = new Map<string, string>();
@@ -94,6 +96,15 @@ function injectStyle() {
     .szp-gh.frozen .szp-gav { border: 2px dashed #a3a3a3; filter: grayscale(.7); opacity: .8; }
     .szp-gh.frozen .szp-gname { color: #d4d4d4; }
     .szp-gh.dead { opacity: .4; }
+    .szp-chest { position: absolute; left: 0; top: 0; pointer-events: none; will-change: transform; }
+    .szp-chest img {
+      position: absolute; left: -11px; top: -11px; width: 22px; height: 22px; image-rendering: pixelated;
+      opacity: .8; filter: grayscale(.35) drop-shadow(0 0 2px #000);
+    }
+    .szp-chest::after {
+      content: ""; position: absolute; left: -15px; top: -15px; width: 30px; height: 30px; box-sizing: border-box;
+      border: 2px dashed rgba(250, 204, 21, .75); border-radius: 50%;
+    }
     .szp-fc-label {
       position: absolute; left: 0; top: 0; white-space: nowrap; pointer-events: none;
       font: 600 12px/1.2 system-ui, sans-serif; color: #dcfce7; padding: 3px 8px; border-radius: 999px;
@@ -107,6 +118,7 @@ function injectStyle() {
 const onRender = () => {
   positionForecastLabel();
   positionGhosts();
+  positionChests();
   if (forecast && !forecastReady) ensureForecast();
 };
 const onDragStart = (e: MlMapEvent) => {
@@ -171,9 +183,11 @@ function attach(m: MlMap) {
   m.getContainer().appendChild(overlay);
   markerEls.clear();
   ghostEls.clear();
+  chestEls.clear();
   renderers = findRenderers(m);
   renderMarkers();
   renderGhosts();
+  renderChests();
   forecastReady = false;
   ensureForecast();
   send({ type: "mapStatus", found: true, native: renderers.length > 0 });
@@ -202,6 +216,7 @@ function detach() {
   map = null;
   markerEls.clear();
   ghostEls.clear();
+  chestEls.clear();
   if (following) {
     following = null;
     send({ type: "followStopped", reason: "map-lost" });
@@ -290,7 +305,19 @@ function positionMarkers() {
 
 // ------------------------------------------------------------------ ghosts (blackout fallback)
 
-const ghostEls = new Map<string, { el: HTMLDivElement; key: string; placed: string }>();
+const ghostEls = new Map<string, { el: HTMLDivElement; key: string; placed: string; label: string; seenAt: number | null }>();
+
+/** "3m 12s" since `seenAt` (this browser's clock). */
+const since = (seenAt: number | null) => (seenAt === null ? "?" : formatDuration(Date.now() - seenAt));
+
+/** Frozen ghosts show how long they've been frozen, counting up every second. */
+function tickGhostAges() {
+  for (const e of ghostEls.values()) {
+    if (e.seenAt === null || e.el.style.visibility === "hidden") continue;
+    (e.el.lastElementChild as HTMLElement).textContent = "⏸ " + e.label + " · " + since(e.seenAt) + " ago";
+  }
+}
+setInterval(tickGhostAges, 1000);
 
 function renderGhosts() {
   if (!overlay) return;
@@ -308,10 +335,12 @@ function renderGhosts() {
       el.innerHTML = '<div class="szp-gav"></div><div class="szp-gname"></div>';
       el.style.visibility = "hidden";
       overlay.prepend(el); // beneath the highlight rings
-      entry = { el, key: "", placed: "" };
+      entry = { el, key: "", placed: "", label: g.label, seenAt: null };
       ghostEls.set(g.id, entry);
     }
-    const key = [g.label, g.avatar, g.live, g.age, g.dead].join("|");
+    entry.label = g.label;
+    entry.seenAt = g.live ? null : g.seenAt;
+    const key = [g.label, g.avatar, g.live, g.seenAt, g.dead].join("|");
     if (key !== entry.key) {
       entry.key = key;
       entry.el.className = "szp-gh" + (g.live ? "" : " frozen") + (g.dead ? " dead" : "");
@@ -319,8 +348,7 @@ function renderGhosts() {
       av.style.backgroundImage = g.avatar ? 'url("' + g.avatar.replace(/["\\]/g, "") + '")' : "";
       av.textContent = g.avatar ? "" : g.label.slice(0, 1).toUpperCase();
       // ⏸ = not moving: no position update since this one.
-      (entry.el.lastElementChild as HTMLElement).textContent = g.live ? g.label : "⏸ " + g.label + " · " + (g.age ?? "?") + " ago";
-      entry.el.title = g.live ? "" : g.label + " has not reported a position for " + (g.age ?? "a while") + ": shown where they were last seen";
+      (entry.el.lastElementChild as HTMLElement).textContent = g.live ? g.label : "⏸ " + g.label + " · " + since(g.seenAt) + " ago";
     }
   }
   positionGhosts();
@@ -346,6 +374,49 @@ function positionGhosts() {
     }
     const [x, y] = placed.split(":");
     entry.el.style.transform = "translate(" + x + "px, " + y + "px)";
+    entry.el.style.visibility = "";
+  }
+}
+
+// ------------------------------------------------------------------ remembered chests (blackout fallback)
+
+const chestEls = new Map<string, { el: HTMLDivElement; placed: string }>();
+
+function renderChests() {
+  if (!overlay) return;
+  const keep = new Set(chests.map((c) => c.id));
+  for (const [id, c] of chestEls) {
+    if (!keep.has(id)) {
+      c.el.remove();
+      chestEls.delete(id);
+    }
+  }
+  for (const c of chests) {
+    if (chestEls.has(c.id)) continue;
+    const el = document.createElement("div");
+    el.className = "szp-chest";
+    const img = document.createElement("img");
+    img.src = c.icon;
+    img.alt = "";
+    el.appendChild(img);
+    el.style.visibility = "hidden";
+    overlay.prepend(el); // under players
+    chestEls.set(c.id, { el, placed: "" });
+  }
+  positionChests();
+}
+
+function positionChests() {
+  if (!map || !chestEls.size) return;
+  const byId = new Map(chests.map((c) => [c.id, c]));
+  for (const [id, entry] of chestEls) {
+    const c = byId.get(id);
+    if (!c) continue;
+    const q = map.project([c.lng, c.lat]);
+    const placed = Math.round(q.x) + ":" + Math.round(q.y);
+    if (placed === entry.placed) continue;
+    entry.placed = placed;
+    entry.el.style.transform = "translate(" + Math.round(q.x) + "px, " + Math.round(q.y) + "px)";
     entry.el.style.visibility = "";
   }
 }
@@ -468,6 +539,10 @@ function handle(msg: ToPage) {
       ghosts = msg.ghosts;
       renderGhosts();
       ensureFrameLoop();
+      return;
+    case "chests":
+      chests = msg.chests;
+      renderChests();
       return;
     case "anchors":
       anchorIds.clear();

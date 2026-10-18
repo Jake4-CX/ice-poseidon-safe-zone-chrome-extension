@@ -545,3 +545,49 @@ test("alerts dock in the map's top-left control corner when the map is present",
   assert.match(host.shadowRoot!.querySelector(".toast")!.textContent!, /Tazo was eliminated \(map\)/);
   assert.ok(![...root.querySelectorAll(".toasts .toast")].some((t) => /\(map\)/.test(t.textContent!)), "not duplicated in the panel");
 });
+
+// Keep last: leaves the replayed game in the "server withholds players" (EMP) state.
+test("EMP with the setting on: cached players stay in the panel and on the map as frozen ghosts", async () => {
+  const state = app.client.state;
+  const known = state.players().filter((p: { location: unknown }) => p.location).length;
+  state.event.map.blackout = { until: new Date(Date.now() + 600_000).toISOString(), source: "emp" };
+  await app.store.updateSettings({ showDuringBlackout: true });
+  // What the server sends during an EMP: no slots, then empty location/status frames.
+  const clearOf = (kind: number) => {
+    const src = frames.find((f) => typeof f !== "string" && new Uint8Array(f as ArrayBuffer)[0] === kind) as ArrayBuffer;
+    const head = new Uint8Array(src.slice(0, 36));
+    const view = new DataView(head.buffer);
+    view.setUint16(2, 3, true);
+    view.setUint32(8, 0xfffffff0, true);
+    view.setUint16(28, 0, true);
+    view.setUint16(30, 1, true);
+    view.setUint16(32, 0, true);
+    return head.buffer;
+  };
+  const chestsBefore = state.chests().filter((c: { claimed: boolean }) => !c.claimed).length;
+  const zonesOnly = state.mapObjects.filter((o: { type: string }) => o.type === "safe_zone");
+  state.ingestAll([
+    JSON.stringify({ type: "contestants", data: { roster: null, slots: { definition_sequence: state.slotsDefinition + 1, slots: [] } } }),
+    clearOf(1),
+    clearOf(2),
+    JSON.stringify({ type: "map_objects", data: zonesOnly }), // chests removed too
+  ]);
+  assert.equal(state.slots.size, 0, "slots withheld");
+  toPage.length = 0;
+  app.lastGhosts = app.lastChests = "";
+  app.onState(new Set(["slots"]));
+  $<HTMLInputElement>("input").value = app.query = "";
+  app.ui.filter = "alive";
+  app.renderNow();
+  assert.notEqual($(".hstats").textContent, "loading…", "not stuck on loading");
+  assert.ok($$(".row").length > 10, "player rows still listed");
+  assert.match($(".banner").textContent!, /sends no player data until then/);
+  assert.match($(".row .l2").textContent!, /frozen/);
+  const ghosts = toPage.filter((m) => m.type === "ghosts").at(-1)!.ghosts as { live: boolean }[];
+  assert.ok(ghosts.length > 0 && ghosts.length <= known, "ghosts at remembered positions");
+  assert.ok(ghosts.every((g) => !g.live), "all frozen (⏸)");
+  assert.ok(ghosts.every((g) => typeof (g as unknown as { seenAt: unknown }).seenAt === "number"), "frozen ghosts carry when they were seen; the bridge counts up");
+  assert.ok(chestsBefore > 0, "fixture has chests");
+  const chests = toPage.filter((m) => m.type === "chests").at(-1)!.chests as unknown[];
+  assert.equal(chests.length, chestsBefore, "unclaimed chests from before the EMP are drawn");
+});

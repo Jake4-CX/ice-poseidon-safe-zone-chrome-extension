@@ -28,9 +28,21 @@ export interface GhostMarker {
   label: string;
   avatar: string | null;
   live: boolean;
-  /** "4m" for frozen positions. */
-  age: string | null;
+  /**
+   * For frozen positions: when it was recorded, on this browser's clock. The bridge counts the
+   * "3m 12s ago" label up every second itself, so this never changes while frozen.
+   */
+  seenAt: number | null;
   dead: boolean;
+}
+
+/** A chest remembered from before a blackout (the server hides all chests during one). */
+export interface ChestMarker {
+  id: string;
+  lat: number;
+  lng: number;
+  icon: string;
+  rarity: string | null;
 }
 
 export interface PlayerPoint {
@@ -50,6 +62,8 @@ export type ToPage =
   | { type: "anchors"; ids: string[] }
   /** Players to draw ourselves where the site isn't drawing a sprite; [] turns this off. */
   | { type: "ghosts"; ghosts: GhostMarker[] }
+  /** Remembered chests to draw while the server hides them; [] clears. */
+  | { type: "chests"; chests: ChestMarker[] }
   /** Zone forecast drawn as native map layers; null clears it. */
   | { type: "zoneForecast"; forecast: ZoneForecast | null }
   | { type: "ping" };

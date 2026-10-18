@@ -1,0 +1,86 @@
+# Publishes a GitHub release whenever version.json changes on main.
+#
+# version.json is what installed copies poll for updates, so changing it is the signal that a
+# version is ready. This workflow tests and builds that exact commit, then creates release
+# v<version> with the zip attached and docs/release-notes/v<version>.md as the description.
+# Re-running for a version that already has a release does nothing.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [version.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Read and check versions
+        id: version
+        run: |
+          node -e '
+            const fs = require("fs");
+            const read = (f) => JSON.parse(fs.readFileSync(f, "utf8")).version;
+            const v = { manifest: read("extension/manifest.json"), package: read("package.json"), versionJson: read("version.json") };
+            if (new Set(Object.values(v)).size !== 1) {
+              console.error("::error::Versions disagree: " + JSON.stringify(v));
+              process.exit(1);
+            }
+            const notes = `docs/release-notes/v${v.manifest}.md`;
+            if (!fs.existsSync(notes)) {
+              console.error(`::error::Missing ${notes} (the release description)`);
+              process.exit(1);
+            }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${v.manifest}\nnotes=${notes}\n`);
+          '
+
+      - name: Skip if already released
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" > /dev/null 2>&1; then
+            echo "v${{ steps.version.outputs.version }} is already released; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install
+        if: steps.exists.outputs.skip != 'true'
+        run: npm ci
+
+      - name: Typecheck and test
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Build zip
+        if: steps.exists.outputs.skip != 'true'
+        run: npm run package:ext
+
+      - name: Publish release
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          gh release create "v$v" "release/safezone-plus-v$v.zip" \
+            --title "SafeZone+ v$v" \
+            --notes-file "${{ steps.version.outputs.notes }}" \
+            --target "${{ github.sha }}" \
+            --latest

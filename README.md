@@ -88,13 +88,20 @@ Use `npm run watch:ext` while developing, and reload the extension after each ch
 
 ## Releasing
 
-1. Bump `version` in `extension/manifest.json` (and `package.json`).
-2. `npm run package:ext` builds `release/safezone-plus-v<version>.zip` and syncs `version.json`.
-   Write a one-line summary in its `notes`.
-3. Publish a GitHub release (tag `v<version>`) with the zip attached.
-4. **Then** commit and push `version.json` to `main`. Installed copies poll
-   `raw.githubusercontent.com/.../main/version.json` every few hours, so pushing it earlier would
-   announce an update nobody can download yet.
+Releases are published by GitHub Actions ([release.yml](.github/workflows/release.yml)) when
+`version.json` changes on `main`:
+
+1. Bump `version` in `extension/manifest.json` and `package.json`.
+2. `npm run package:ext` syncs `version.json`. Write its `notes` (one line, shown in the
+   extension's update notice).
+3. Write `docs/release-notes/v<version>.md` (the release description).
+4. Commit and push to `main`. The workflow typechecks, tests, builds the zip and creates release
+   `v<version>` with it attached. It refuses to publish if the three versions disagree or the
+   notes file is missing, and skips versions that are already released.
+
+Installed copies check `version.json` every few hours, so they hear about the release shortly
+after the workflow publishes it. Claude Code sessions can run the
+[release skill](.claude/skills/release/SKILL.md) to prepare all of this.
 
 ## How it works
 

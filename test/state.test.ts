@@ -134,3 +134,68 @@ test("lastSeen keeps positions after the server clears locations (blackout fallb
     assert.deepEqual(q.lastSeen, p.location, `${p.username} keeps their last position`);
   }
 });
+
+/** What the server sends at the start of an EMP (seen live 2026-10-18): empty slots + clear frames. */
+function empFrames(state: SafeZoneState) {
+  const clearOf = (kind: number) => {
+    const src = frames.find((f) => typeof f !== "string" && new Uint8Array(f)[0] === kind) as ArrayBuffer;
+    const head = new Uint8Array(src.slice(0, 36));
+    const view = new DataView(head.buffer);
+    view.setUint16(2, 3, true); // full | clear
+    view.setUint32(8, 0xfffffff0, true); // newer sequence
+    view.setUint16(28, 0, true);
+    view.setUint16(30, 1, true);
+    view.setUint16(32, 0, true);
+    return head.buffer;
+  };
+  const slots = { definition_sequence: state.slotsDefinition + 1, slots: [] };
+  return [JSON.stringify({ type: "contestants", data: { roster: null, slots } }), clearOf(1), clearOf(2)];
+}
+
+test("EMP: server empties the slot list; players stay with their last position and status", () => {
+  const state = loadState();
+  const before = state.players();
+  const withLoc = before.filter((p) => p.location);
+  assert.ok(withLoc.length > 10 && !state.playersWithheld);
+  state.ingestAll(empFrames(state));
+  assert.equal(state.slots.size, 0, "server withheld every slot");
+  assert.ok(state.playersWithheld, "detected as withheld");
+  const after = state.players();
+  assert.equal(after.length, before.length, "nobody disappears");
+  for (const p of withLoc) {
+    const q = after.find((x) => x.userId === p.userId)!;
+    assert.equal(q.withheld, true);
+    assert.equal(q.location, null);
+    assert.deepEqual(q.lastSeen, p.location, `${p.username} keeps their last position`);
+    assert.deepEqual(q.status, p.status, `${p.username} keeps their last status`);
+  }
+});
+
+test("EMP on a fresh page: players come from the roster plus remembered positions/statuses", () => {
+  const live = loadState();
+  const p = live.players().find((x) => x.location && x.status)!;
+  const fresh = new SafeZoneState();
+  fresh.ingest(JSON.stringify({
+    type: "contestants",
+    data: {
+      roster: { stale: false, stats_visible: false, contestants: [{ id: "r1", name: p.username, avatar_url: p.avatarUrl, eliminated_at: null, sigil: null, inventory: [], kick_slug: null, live: false, map_user_id: p.userId }] },
+      slots: { definition_sequence: 17, slots: [] },
+    },
+  }));
+  fresh.seedLastSeen({ [p.userId]: p.location! });
+  fresh.seedLastStatus({ [p.userId]: p.status! });
+  assert.ok(fresh.playersWithheld);
+  const [q] = fresh.players();
+  assert.equal(q!.username, p.username);
+  assert.deepEqual(q!.lastSeen, p.location);
+  assert.equal(q!.status!.hp, p.status!.hp);
+});
+
+test("chests are remembered when the server removes them all (blackout)", () => {
+  const state = loadState();
+  const unclaimed = state.chests().filter((c) => !c.claimed);
+  assert.ok(unclaimed.length > 0, "fixture has chests");
+  state.ingest(JSON.stringify({ type: "map_objects", data: state.safeZones() }));
+  assert.equal(state.chests().length, 0, "server removed them");
+  assert.deepEqual(state.rememberedChests()!.chests.map((c) => c.id).sort(), unclaimed.map((c) => c.id).sort());
+});

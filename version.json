@@ -1,6 +1,6 @@
 {
-  "version": "0.2.1",
+  "version": "0.3.0",
   "released": "2026-10-18",
-  "notes": "Players and chests no longer disappear during an EMP: they stay where they were last seen, with a live \"frozen for\" timer.",
+  "notes": "Turns off the flashing EMP lightning and map flicker, with a calm frame and countdown instead so you still know a blackout is on.",
   "download": "https://github.com/Jake4-CX/ice-poseidon-safe-zone-chrome-extension/releases/latest"
 }

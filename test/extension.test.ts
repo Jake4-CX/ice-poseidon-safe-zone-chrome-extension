@@ -546,6 +546,52 @@ test("alerts dock in the map's top-left control corner when the map is present",
   assert.ok(![...root.querySelectorAll(".toasts .toast")].some((t) => /\(map\)/.test(t.textContent!)), "not duplicated in the panel");
 });
 
+test("calm EMP effect: the site's flashing overlay is switched off and a frame + countdown shown instead", async () => {
+  const { countdown } = await import("../extension/src/content/emp-effect.js");
+  assert.equal(countdown(247_000), "4:07");
+  assert.equal(countdown(3_727_000), "1:02:07");
+
+  // Stand-ins for the site's map and its EMP effect (hashed CSS-module class names).
+  const mapEl = document.createElement("div");
+  mapEl.className = "maplibregl-map";
+  mapEl.getBoundingClientRect = () => ({ left: 0, top: 100, width: 1200, height: 700, right: 1200, bottom: 800, x: 0, y: 100, toJSON() {} }) as DOMRect;
+  const canvas = document.createElement("div");
+  canvas.className = "maplibregl-canvas-container _shocked_9zz9_93 _humming_9zz9_97";
+  const storm = document.createElement("div");
+  storm.className = "_storm_9zz9_1";
+  mapEl.append(canvas, storm);
+  document.body.appendChild(mapEl);
+
+  const state = app.client.state;
+  state.event.map.blackout = { until: new Date(state.now() + 247_000).toISOString(), source: "emp" };
+  await app.store.updateSettings({ calmEmp: true, showDuringBlackout: false });
+  app.syncEmpEffect();
+  app.renderNow();
+  const view = dom.window;
+  assert.ok(document.documentElement.classList.contains("szp-calm-emp"), "calm mode on");
+  assert.equal(view.getComputedStyle(storm).display, "none", "lightning/tint/scanlines overlay hidden");
+  assert.equal(view.getComputedStyle(canvas).animationName || "none", "none", "map flicker stopped");
+  const pill = $(".emp-pill");
+  assert.ok(!pill.hidden && !$(".emp-frame").hidden, "calm indicator shown");
+  assert.match(pill.textContent!, /EMP blackout · ends in 4:0[67]/);
+  assert.equal(pill.style.top, "110px", "pill sits at the top of the map");
+  assert.match($(".hstats").textContent!, /⚡ EMP 4:0[67]/, "countdown in the panel header (visible when collapsed)");
+
+  // Setting off: the site's effect is left alone and our indicator hides.
+  await app.store.updateSettings({ calmEmp: false });
+  app.syncEmpEffect();
+  assert.ok(!document.documentElement.classList.contains("szp-calm-emp"), "site effect untouched");
+  assert.notEqual(view.getComputedStyle(storm).display, "none");
+  assert.ok($(".emp-pill").hidden, "pill hidden");
+
+  // Blackout over: nothing shown.
+  await app.store.updateSettings({ calmEmp: true });
+  state.event.map.blackout = null;
+  app.syncEmpEffect();
+  assert.ok($(".emp-pill").hidden && $(".emp-frame").hidden, "indicator gone after the blackout");
+  mapEl.remove();
+});
+
 // Keep last: leaves the replayed game in the "server withholds players" (EMP) state.
 test("EMP with the setting on: cached players stay in the panel and on the map as frozen ghosts", async () => {
   const state = app.client.state;

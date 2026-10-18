@@ -41,6 +41,7 @@ import {
 import { buildForecast, zoneMotionText } from "./forecast.js";
 import { MapToasts } from "./map-toasts.js";
 import { SiteHeader } from "./site-header.js";
+import { EmpEffect, countdown } from "./emp-effect.js";
 import { RELEASES_URL } from "../update.js";
 import type { ClaimableObject, PlayerLocation, PlayerStatus } from "../../../src/core/index.js";
 import { Store, loadUi, saveUi, type UiState } from "./store.js";
@@ -167,6 +168,7 @@ export class App {
   private lastGhosts = "";
   private lastChests = "";
   private siteHeader!: SiteHeader;
+  private empEffect!: EmpEffect;
   private update: UpdateStatus | null = null;
   private lastSeenSaved = "";
   private lastSeenSavedAt = 0;
@@ -210,6 +212,7 @@ export class App {
     this.buildDom();
     this.disposers.push(this.store.onChange(() => {
       this.siteHeader.sync(this.store.settings.hideHeader);
+      this.syncEmpEffect();
       this.lastMarkers = "";
       this.lastForecast = "";
       this.renderSettings();
@@ -230,6 +233,7 @@ export class App {
     const tick = setInterval(() => {
       this.scheduleRender();
       this.siteHeader.sync(this.store.settings.hideHeader);
+      this.syncEmpEffect();
       this.saveLastSeen();
     }, 1000);
     this.disposers.push(() => clearInterval(tick));
@@ -237,6 +241,7 @@ export class App {
     this.client.start();
     this.toPage({ type: "ping" });
     this.siteHeader.sync(this.store.settings.hideHeader);
+    this.syncEmpEffect();
     void this.checkUpdate();
     this.renderNow();
   }
@@ -256,6 +261,7 @@ export class App {
     this.toPage({ type: "unfollow" });
     this.mapToasts.destroy();
     this.siteHeader?.destroy();
+    this.empEffect?.destroy();
     this.host?.remove();
   }
 
@@ -298,6 +304,8 @@ export class App {
         <div class="toasts"></div>
       </div>
       <div class="card" role="dialog" aria-label="Player actions" hidden></div>
+      <div class="emp-frame" hidden></div>
+      <div class="emp-pill" hidden></div>
       <button class="hdr-tab" title="Show the site header" aria-label="Show the site header" hidden>${ICON.expand}</button>`;
     const q = <T extends Element>(sel: string) => this.root.querySelector(sel) as T;
     this.$ = {
@@ -333,6 +341,7 @@ export class App {
     this.$.panel.addEventListener("pointerdown", raise(this.$.panel, this.stream.el), true);
     this.stream.el.addEventListener("pointerdown", raise(this.stream.el, this.$.panel), true);
     this.siteHeader = new SiteHeader(this.$.headerTab);
+    this.empEffect = new EmpEffect(q(".emp-frame"), q(".emp-pill"));
     this.applyPosition();
     this.applyCollapsed();
     this.wireEvents();
@@ -488,6 +497,12 @@ export class App {
   /** Blackout active but the user chose to keep seeing players: we draw them ourselves. */
   private get bypassing(): boolean {
     return this.blackoutActive && this.mode === "normal";
+  }
+
+  /** Swap the site's flashing EMP animation for our calm frame + countdown (if enabled). */
+  private syncEmpEffect() {
+    const state = this.client.state;
+    this.empEffect.sync(this.store.settings.calmEmp, this.blackoutActive ? state.blackout : null, state.now());
   }
 
   /** Current position, or (while bypassing a blackout) the last one we ever received. */
@@ -1037,6 +1052,7 @@ export class App {
     else if (el.name === "zoneForecast") void this.store.updateSettings({ zoneForecast: (el as HTMLInputElement).checked });
     else if (el.name === "forecastMinutes") void this.store.updateSettings({ forecastMinutes: Number(el.value) });
     else if (el.name === "showDuringBlackout") void this.store.updateSettings({ showDuringBlackout: (el as HTMLInputElement).checked });
+    else if (el.name === "calmEmp") void this.store.updateSettings({ calmEmp: (el as HTMLInputElement).checked });
     else if (el.name === "hideHeader") void this.store.updateSettings({ hideHeader: (el as HTMLInputElement).checked });
     else if (el.name === "contestantInfo") void this.store.updateSettings({ contestantInfo: (el as HTMLInputElement).checked });
     else if (el.name.startsWith("kind:")) {
@@ -1074,11 +1090,15 @@ export class App {
     this.$.conn.className = `conn ${this.conn}`;
     this.$.conn.title = `Feed: ${this.conn}${this.mapFound ? "" : " · map not detected yet"}`;
     const players = state.players();
+    const bo = this.blackoutActive ? state.blackout! : null;
+    const emp = bo
+      ? `<span class="emp" title="${bo.source === "smoke" ? "Smoke" : "EMP"} blackout until ${timeOf(Date.parse(bo.until))}">⚡ ${bo.source === "smoke" ? "Smoke" : "EMP"} ${countdown(Date.parse(bo.until) - state.now())}</span>`
+      : "";
     if (this.mode !== "normal" || !players.length) {
-      this.$.hstats.textContent = players.length ? "" : "loading…";
+      this.$.hstats.innerHTML = emp || (players.length ? "" : "loading…");
       return;
     }
-    const alive = players.filter((p) => p.status?.alive).length;
+    const alive = players.filter((p) => !isDead(p)).length;
     const zones = state.safeZones();
     const zone = state.safeZone();
     const z = zone ? zoneAt(zone, state.now()) : null;
@@ -1088,6 +1108,7 @@ export class App {
       ? `<span title="${zones.map((zz) => formatDistance(zoneAt(zz, state.now()).radius)).join(" + ")} radius circles; safe inside any of them">${zones.length} zones</span>`
       : z ? `zone ${formatDistance(z.radius)}` : "";
     this.$.hstats.innerHTML =
+      (emp ? `${emp} · ` : "") +
       `<span class="n">${alive}</span>/${players.length} alive` +
       (zoneText ? ` · ${zoneText}${shrinking ? ' <span class="warn" title="Zone is shrinking">▼</span>' : ""}` : "") +
       (moving ? ` <span class="zmove" title="Zone drift (estimated from recent updates)">${moving.replace(/ [NSEW]+ /, " ")}</span>` : "") +
@@ -1535,7 +1556,8 @@ export class App {
       <div>
         <h4>Blackouts</h4>
         <label><input type="checkbox" name="showDuringBlackout"${s.showDuringBlackout ? " checked" : ""}> Keep showing players during EMP / smoke blackouts</label>
-        <div class="hint">The EMP is meant to blind contestants, not viewers. Players whose position stops updating stay at their last known spot (dashed outline).</div>
+        <label><input type="checkbox" name="calmEmp"${s.calmEmp ? " checked" : ""}> Turn off the flashing EMP effect (lightning, flicker, map warping)</label>
+        <div class="hint">With the effect off, a blue frame and a countdown at the top of the map show while a blackout is on. The EMP is meant to blind contestants, not viewers. Players whose position stops updating stay at their last known spot (dashed outline).</div>
       </div>
       <div>
         <h4>Players</h4>

@@ -62,6 +62,20 @@ svg { width: 16px; height: 16px; display: block; }
 .about { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 .about > span { flex: 1 1 100%; }
 
+/* Calm stand-in for the site's EMP animation: a static frame round the map and a countdown. */
+.emp-frame {
+  position: fixed; z-index: 2147482900; pointer-events: none;
+  box-shadow: inset 0 0 0 2px rgba(96,165,250,.75), inset 0 0 70px rgba(59,130,246,.28);
+}
+.emp-pill {
+  position: fixed; z-index: 2147482905; transform: translateX(-50%); pointer-events: auto; cursor: default;
+  padding: 5px 12px; border-radius: 999px; white-space: nowrap;
+  font: 600 13px/1.2 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; color: #dbeafe;
+  background: rgba(15, 23, 42, .88); border: 1px solid rgba(96,165,250,.8); box-shadow: 0 4px 18px rgba(0,0,0,.45);
+  font-variant-numeric: tabular-nums;
+}
+.hstats .emp { color: #93c5fd; font-weight: 600; font-variant-numeric: tabular-nums; }
+
 /* Pull tab that brings the site's hidden header back. */
 .hdr-tab {
   position: fixed; z-index: 2147482995; top: 0; left: 50%; transform: translateX(-50%);

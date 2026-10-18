@@ -139,6 +139,8 @@ export interface Settings {
   contestantInfo: boolean;
   /** Tuck the site's header (logo, tabs, account) away; it slides back in on demand. */
   hideHeader: boolean;
+  /** Replace the site's flashing EMP animation with a calm frame and countdown. */
+  calmEmp: boolean;
 }
 
 export const ALERT_KIND_LABELS: Record<AlertKind, string> = {
@@ -180,6 +182,7 @@ export const DEFAULT_SETTINGS: Settings = {
   showDuringBlackout: false,
   contestantInfo: true,
   hideHeader: false,
+  calmEmp: true,
 };
 
 export interface Favourite {

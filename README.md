@@ -41,6 +41,7 @@ Chrome extension (adds a panel to `/safezone/map`):
 - **Contestant info.** Inventory, sigil and the activity log from the site's player card, right in the player's details. When the site opens its own card, SafeZone+'s actions (★, Watch, Kick, locate) appear inside it.
 - **Multiple zones.** When the event runs several safe zones, distances, edge ETAs and the forecast use their combined area (safe inside any of them).
 - **More map room (optional).** *Settings → Site* tucks the site's header away. Move the pointer to the top edge, or click the small tab, to get the tabs and your account menu back.
+- **No flashing EMP effect.** The site's lightning, flashes and flickering map during an EMP are replaced by a calm blue frame and a countdown (*Settings → Blackouts* to bring the original back).
 - **Blackouts (optional).** An EMP is meant to blind contestants, not viewers. Turn on *Settings → Blackouts* to keep seeing players during one; anyone whose position stops updating stays at their last known spot (dashed).
 - **Details.** Coordinates with a Google Maps link, distance and direction to the zone centre, whether the player will still be inside after the current shrink, and nearby zombies, chests and items.
 

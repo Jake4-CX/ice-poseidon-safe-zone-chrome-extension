@@ -9,6 +9,8 @@ Chrome extension built on that client.
 > **Unofficial fan project.** Not affiliated with or endorsed by Ice Poseidon or the Safe Zone
 > event team. It only reads the map's public live feed and changes nothing on the server.
 
+![SafeZone+ panel on the Safe Zone map: Low HP list, gold rings on favourites and the zone's 10-minute forecast](docs/screenshots/overview.jpg)
+
 ## Install
 
 1. Download `safezone-plus-vX.Y.Z.zip` from the [latest release](../../releases/latest).
@@ -36,7 +38,24 @@ Chrome extension (adds a panel to `/safezone/map`):
 - **Filters.** Favourites, Alive, Outside zone, Low HP, Chased, Eliminated.
 - **Details.** Coordinates with a Google Maps link, distance and direction to the zone centre, whether the player will still be inside after the current shrink, and nearby zombies, chests and items.
 
-CLI (`npm run cli -- <command>`):
+## Screenshots
+
+**Watch a stream on the map.** Drag, resize, mute, or 📌 pin it under the player so it follows them.
+
+![Floating Kick player over the map](docs/screenshots/stream-player.jpg)
+
+**Click a player** for the action bar, or expand them in the panel for position, zone ETA,
+nearby zombies and links.
+
+![Action bar under a player and the expanded details row](docs/screenshots/player-details.jpg)
+
+| Favourites | Alerts | Settings |
+| --- | --- | --- |
+| ![Favourites list with HP, Kick live status and edge ETA](docs/screenshots/favourites.png) | ![Alert history for favourites](docs/screenshots/alerts.png) | ![Alert, map and zone forecast settings](docs/screenshots/settings.png) |
+
+## CLI
+
+`npm run cli -- <command>`:
 
 ```text
 stats                      zone, alive count, outside-zone and lowest-HP players

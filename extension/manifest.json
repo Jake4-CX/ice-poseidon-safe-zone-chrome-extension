@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SafeZone+",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Search players, star favourites, watch their Kick streams and get alerts on Ice Poseidon's Safe Zone map.",
   "minimum_chrome_version": "111",
   "icons": {

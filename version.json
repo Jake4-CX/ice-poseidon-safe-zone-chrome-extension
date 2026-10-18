@@ -1,6 +1,6 @@
 {
-  "version": "0.2.0",
+  "version": "0.2.1",
   "released": "2026-10-18",
-  "notes": "Keeps players visible through EMP blackouts, supports multiple safe zones, shows inventory and activity, and can hide the site header.",
+  "notes": "Players and chests no longer disappear during an EMP: they stay where they were last seen, with a live \"frozen for\" timer.",
   "download": "https://github.com/Jake4-CX/ice-poseidon-safe-zone-chrome-extension/releases/latest"
 }
